@@ -25,6 +25,7 @@ impl Tokenizer {
     fn make_options(
         &self,
         add_special_tokens: bool,
+        encode_special_tokens: bool,
         padding: PaddingArg,
     ) -> PyResult<EncodeOptions> {
         let padding = match padding {
@@ -36,6 +37,7 @@ impl Tokenizer {
         };
         Ok(EncodeOptions {
             add_special_tokens,
+            encode_special_tokens,
             padding,
         })
     }
@@ -163,21 +165,25 @@ impl Tokenizer {
     ///         The text to encode.
     ///     add_special_tokens: bool
     ///          Whether the post-processor adds its special tokens, such as `[CLS]` and `[SEP]`.
+    ///     encode_special_tokens: bool
+    ///         Whether special tokens should be encoded, ie go through the tokenizer model (`True`)
+    ///         or be replaced by their id in the added vocabulary.
     ///     padding: `Padding` or `None`
     ///         Padding options. Pass `None` to disable padding.
     ///         When omitted, defaults to the padding options configured on the tokenizer.
     ///
     /// Returns:
     ///     Encoding
-    #[pyo3(signature = (text, *, add_special_tokens=true, padding=PaddingArg::InheritConfig))]
+    #[pyo3(signature = (text, *, add_special_tokens=true, encode_special_tokens=false, padding=PaddingArg::InheritConfig))]
     fn encode(
         &self,
         py: Python<'_>,
         text: String,
         add_special_tokens: bool,
+        encode_special_tokens: bool,
         padding: PaddingArg,
     ) -> PyResult<Encoding> {
-        let options = self.make_options(add_special_tokens, padding)?;
+        let options = self.make_options(add_special_tokens, encode_special_tokens, padding)?;
         // py.detach releases the GIL while encode runs on Rust side
         let encodings = py
             .detach(|| self.pipeline.encode(text, &options).wait())
@@ -193,21 +199,25 @@ impl Tokenizer {
     ///         The batch of text to encode.
     ///     add_special_tokens: bool
     ///         Whether the post-processor adds its special tokens, such as `[CLS]` and `[SEP]`.
+    ///     encode_special_tokens: bool
+    ///         Whether special tokens should be encoded, ie go through the tokenizer model (`True`)
+    ///         or be replaced by their id in the added vocabulary.
     ///     padding: `Padding` or `None`
     ///         Padding options. Pass `None` to disable padding.
     ///         When omitted, defaults to the padding options configured on the tokenizer.
     ///
     /// Returns:
     ///     List[Encoding]
-    #[pyo3(signature = (texts, *, add_special_tokens=true, padding=PaddingArg::InheritConfig))]
+    #[pyo3(signature = (texts, *, add_special_tokens=true, encode_special_tokens=false, padding=PaddingArg::InheritConfig))]
     fn encode_batch(
         &self,
         py: Python<'_>,
         texts: Vec<String>,
         add_special_tokens: bool,
+        encode_special_tokens: bool,
         padding: PaddingArg,
     ) -> PyResult<Vec<Encoding>> {
-        let options = self.make_options(add_special_tokens, padding)?;
+        let options = self.make_options(add_special_tokens, encode_special_tokens, padding)?;
         // py.detach releases the GIL while encode runs on Rust side
         let encodings = py
             .detach(|| self.pipeline.encode(texts, &options).wait())
