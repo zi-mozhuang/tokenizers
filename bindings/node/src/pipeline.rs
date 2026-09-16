@@ -21,8 +21,10 @@ fn err<E: std::fmt::Display>(e: E) -> Error {
 #[napi(object)]
 #[derive(Default)]
 pub struct EncodeOptions {
-  /// `true` unless set.
+  /// Defaults to `true` when not set
   pub add_special_tokens: Option<bool>,
+  /// Defaults to `false` when not set
+  pub encode_special_tokens: Option<bool>,
   /// `false` turns the tokenizer's configured padding off, a `PaddingOptions` changes it for
   /// this call, `true` or left out keeps it.
   pub padding: Option<Either<bool, PaddingOptions>>,
@@ -79,6 +81,7 @@ impl PipelineTokenizer {
     let options = options.unwrap_or_default();
     Ok(PipelineEncodeOptions {
       add_special_tokens: options.add_special_tokens.unwrap_or(true),
+      encode_special_tokens: options.encode_special_tokens.unwrap_or_default(),
       padding: match options.padding {
         None | Some(Either::A(true)) => Override::InheritConfig,
         Some(Either::A(false)) => Override::Off,

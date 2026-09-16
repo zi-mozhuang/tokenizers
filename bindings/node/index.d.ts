@@ -22,8 +22,10 @@ export declare class PipelineTokenizer {
 
 /** Per-call settings. A field left out keeps the tokenizer's own behaviour. */
 export interface EncodeOptions {
-  /** `true` unless set. */
+  /** Defaults to `true` when not set */
   addSpecialTokens?: boolean
+  /** Defaults to `false` when not set */
+  encodeSpecialTokens?: boolean
   /**
    * `false` turns the tokenizer's configured padding off, a `PaddingOptions` changes it for
    * this call, `true` or left out keeps it.
