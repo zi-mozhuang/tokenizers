@@ -90,15 +90,20 @@ impl PartialEq<PipelineToken> for u32 {
 /// Finds special/added tokens in a text segment so the pipeline can carve them
 /// out before running the model.
 pub trait PipelinePatternMatcher {
-    /// Return the first special token in `input` as `Some(((start, end), id))`, where
-    /// `start..end` is its byte range. `normalized` selects whether to match the
-    /// tokens declared on normalized or on raw text.
-    /// Returns `None` if there is no special tokens in input.
+    /// Return the first special or added token in `input` as `Some(((start, end), id))`, where
+    /// `start..end` is its byte range.
+    /// 
+    /// Set `normalized` to true when the text is normalized.
+    /// Set `encode_special_tokens` to `true` to treat special tokens as plain text and encode them through the tokenizer model,
+    /// or `false` to extract them.
+    /// 
+    /// Returns `None` if there is no added tokens in input.
     fn extract_next(
         &self,
         full_input: &[u8],
         search_offset: usize,
         normalized: bool,
+        encode_special_tokens: bool,
     ) -> Option<((usize, usize), u32)>;
 }
 
@@ -116,7 +121,7 @@ pub enum Segment<'a> {
 /// ([`Segment::SpecialToken`]) matched by the [`PipelinePatternMatcher`].
 ///
 /// ```ignore
-/// for segment in SpecialSegmentIterator::new(input, pattern_matcher, false) {
+/// for segment in SpecialSegmentIterator::new(input, pattern_matcher, false, false) {
 ///     match segment {
 ///         Segment::SpecialToken(id) => { /* emit the special token */ }
 ///         Segment::Text { text, input_offset } => { /* tokenize this chunk */ }
@@ -130,6 +135,8 @@ pub struct SpecialSegmentIterator<'a, 'b, PatternMatcher: PipelinePatternMatcher
     pattern_matcher: &'b PatternMatcher,
     /// Whether the input is normalized
     normalized: bool,
+    /// [`EncodeOptions::encode_special_tokens`], forwarded to `extract_next` on every match
+    encode_special_tokens: bool,
     offset: usize,
     pending: Option<u32>,
 }
@@ -139,11 +146,17 @@ impl<'a, 'b, PatternMatcher: PipelinePatternMatcher>
 {
     /// Create a new iterator over [`Segment`] of the [`input`].
     /// This iterator will yield [`Segment`] in order.
-    pub fn new(input: &'a str, pattern_matcher: &'b PatternMatcher, normalized: bool) -> Self {
+    pub fn new(
+        input: &'a str,
+        pattern_matcher: &'b PatternMatcher,
+        normalized: bool,
+        encode_special_tokens: bool,
+    ) -> Self {
         Self {
             input,
             pattern_matcher,
             normalized,
+            encode_special_tokens,
             pending: None,
             offset: 0,
         }
@@ -167,10 +180,12 @@ impl<'a, 'b, PatternMatcher: PipelinePatternMatcher> Iterator
             // We've processed all the input string, return
             return None;
         }
-        if let Some(((start, end), token)) =
-            self.pattern_matcher
-                .extract_next(self.input.as_bytes(), self.offset, self.normalized)
-        {
+        if let Some(((start, end), token)) = self.pattern_matcher.extract_next(
+            self.input.as_bytes(),
+            self.offset,
+            self.normalized,
+            self.encode_special_tokens,
+        ) {
             // `extract_next` positions are absolute in `input`, not relative to `offset`.
             let before_token = &self.input[self.offset..start];
             let input_offset = self.offset;
@@ -608,13 +623,13 @@ impl PipelineTokenizer {
     ) -> Result<Encoding> {
         match input {
             Input::Single(seq) => {
-                let toks = self.encode_sequence_with(&seq, 0, scratch)?;
+                let toks = self.encode_sequence_with(&seq, 0, options, scratch)?;
                 Ok(self.post_process(toks, None, options)?)
             }
             // Each side of a pair is a sequence of its own, so both start at offset 0.
             Input::Pair(s1, s2) => {
-                let a = self.encode_sequence_with(&s1, 0, scratch)?;
-                let b = self.encode_sequence_with(&s2, 0, scratch)?;
+                let a = self.encode_sequence_with(&s1, 0, options, scratch)?;
+                let b = self.encode_sequence_with(&s2, 0, options, scratch)?;
                 Ok(self.post_process(a, Some(b), options)?)
             }
         }
@@ -649,11 +664,17 @@ impl PipelineTokenizer {
         &self,
         input: &str,
         offset: usize,
+        options: &EncodeOptions,
         scratch: &mut EncodeScratch,
         output: &mut Vec<PipelineToken>,
     ) -> Result<()> {
         // First, we extract all special tokens from the non-normalized input
-        for segment in SpecialSegmentIterator::new(input, &self.inner.added_vocabulary, false) {
+        for segment in SpecialSegmentIterator::new(
+            input,
+            &self.inner.added_vocabulary,
+            false,
+            options.encode_special_tokens,
+        ) {
             match segment {
                 Segment::SpecialToken(token) => {
                     output.push(PipelineToken::from(token));
@@ -666,9 +687,12 @@ impl PipelineTokenizer {
                         normalize_all(&self.inner.normalizers, chunk, offset + input_offset)?;
 
                     // Extract special tokens from the normalized input
-                    for segment in
-                        SpecialSegmentIterator::new(&normalized, &self.inner.added_vocabulary, true)
-                    {
+                    for segment in SpecialSegmentIterator::new(
+                        &normalized,
+                        &self.inner.added_vocabulary,
+                        true,
+                        options.encode_special_tokens,
+                    ) {
                         match segment {
                             Segment::SpecialToken(token) => {
                                 output.push(PipelineToken::from(token));
@@ -736,10 +760,11 @@ impl PipelineTokenizer {
         &self,
         input: &str,
         offset: usize,
+        options: &EncodeOptions,
         scratch: &mut EncodeScratch,
     ) -> Result<Vec<PipelineToken>> {
         let mut output = Vec::with_capacity(input.len() / 4);
-        self.encode_sequence_into(input, offset, scratch, &mut output)?;
+        self.encode_sequence_into(input, offset, options, scratch, &mut output)?;
         Ok(output)
     }
 
@@ -763,7 +788,7 @@ impl PipelineTokenizer {
         let reproduces_sequence =
             !template.has_type_ids() && (!options.add_special_tokens || template.n_special() == 0);
         if reproduces_sequence {
-            return self.encode_sequence_into(input, 0, &mut scratch, out);
+            return self.encode_sequence_into(input, 0, options, &mut scratch, out);
         }
         let encoding = self.encode_one(Input::Single(input.to_owned()), options, &mut scratch)?;
         out.extend_from_slice(encoding.ids());
@@ -1073,6 +1098,7 @@ impl ModelScratch for PipelineModelScratch {}
 mod tests {
     use super::*;
     use crate::PaddingStrategy;
+    use crate::vocab::bucket_added_vocabulary::AddedToken;
 
     struct FixedMatcher(Vec<((usize, usize), u32)>);
     impl PipelinePatternMatcher for FixedMatcher {
@@ -1081,6 +1107,7 @@ mod tests {
             _bytes: &[u8],
             search_offset: usize,
             _normalized: bool,
+            _encode_special_tokens: bool,
         ) -> Option<((usize, usize), u32)> {
             self.0
                 .iter()
@@ -1094,7 +1121,7 @@ mod tests {
         let input = "aa<s>bb<s>cc";
         let matcher = FixedMatcher(vec![((2, 5), 0), ((7, 10), 1)]);
 
-        let segments: Vec<_> = SpecialSegmentIterator::new(input, &matcher, false)
+        let segments: Vec<_> = SpecialSegmentIterator::new(input, &matcher, false, false)
             .map(|segment| match segment {
                 Segment::Text { text, .. } => (Some(text), None),
                 Segment::SpecialToken(id) => (None, Some(id)),
@@ -1184,6 +1211,26 @@ mod tests {
         assert!(encodings.iter().all(|e| e.len() == 5));
     }
 
+    // `lol` has no merge in the hello BPE, so it comes back as `l o l` when the model sees it and
+    // as its added id when it is carved out first.
+    #[test]
+    fn encode_special_tokens_sends_the_special_through_the_model() {
+        let pipeline = hello_pipeline_with_special("lol");
+        let carved = EncodeOptions::no_specials();
+        let encoded = EncodeOptions {
+            encode_special_tokens: true,
+            ..EncodeOptions::no_specials()
+        };
+
+        let ids = |options: &EncodeOptions| -> Vec<u32> {
+            let encodings = pipeline.encode("lolhello", options).wait().unwrap();
+            encodings[0].ids().iter().map(|t| t.id()).collect()
+        };
+
+        assert_eq!(ids(&carved), vec![8, 7]);
+        assert_eq!(ids(&encoded), vec![2, 3, 2, 7]);
+    }
+
     #[test]
     fn override_off_turns_off_the_tokenizers_configured_padding() {
         let pipeline = hello_pipeline_with_padding(PaddingParams {
@@ -1237,6 +1284,28 @@ mod tests {
     fn hello_pipeline() -> PipelineTokenizer {
         PipelineTokenizer::from_parts(
             BucketAddedVocabulary::new(),
+            Vec::new(),
+            PipelinePreTokenizer::None,
+            PipelineModel::BPE(hello_bpe()),
+            PipelinePostProcessor::default(),
+            None,
+            Default::default(),
+            None,
+        )
+    }
+
+    fn hello_pipeline_with_special(content: &str) -> PipelineTokenizer {
+        let mut added_vocabulary = BucketAddedVocabulary::new();
+        added_vocabulary
+            .add_special_tokens(
+                [AddedToken::from(content, true)],
+                8,
+                |_| None,
+                None::<&PipelineNormalizer>,
+            )
+            .unwrap();
+        PipelineTokenizer::from_parts(
+            added_vocabulary,
             Vec::new(),
             PipelinePreTokenizer::None,
             PipelineModel::BPE(hello_bpe()),

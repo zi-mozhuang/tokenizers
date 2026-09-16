@@ -114,12 +114,20 @@ fn assert_matches_released(repo: &str, file: &str) {
     };
     let pipeline = tk_serialize::from_json(&canonical)
         .unwrap_or_else(|e| panic!("{repo}: the canonical reader refuses the conversion: {e}"));
-    let released = Released::from_file(&path).expect("the released crate reads it");
+    let mut released = Released::from_file(&path).expect("the released crate reads it");
 
     let mut diverged = Vec::new();
     for text in &cases() {
         let text = text.as_str();
-        for options in [EncodeOptions::no_specials(), EncodeOptions::default()] {
+        for options in [
+            EncodeOptions::no_specials(),
+            EncodeOptions::default(),
+            EncodeOptions {
+                encode_special_tokens: true,
+                ..EncodeOptions::no_specials()
+            },
+        ] {
+            released.set_encode_special_tokens(options.encode_special_tokens);
             let want = released
                 .encode_fast(text, options.add_special_tokens)
                 .unwrap();
