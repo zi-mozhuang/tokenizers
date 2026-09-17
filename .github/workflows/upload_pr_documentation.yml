@@ -8,6 +8,7 @@ on:
 
 jobs:
   build:
+    if: github.event.workflow_run.conclusion == 'success'
     uses: huggingface/doc-builder/.github/workflows/upload_pr_documentation.yml@cf20b09f274383f0d91a7055c5e43f0a2ab3d1a3  # main
     with:
       package_name: tokenizers
