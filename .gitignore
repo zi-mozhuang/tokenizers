@@ -26,4 +26,4 @@ pip-wheel-metadata
 uv.lock
 
 graphify-out/
-temp/
+tmp/
