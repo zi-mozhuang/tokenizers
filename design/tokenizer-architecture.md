@@ -661,37 +661,13 @@ graph TB
 目标：Character-level Tokenizer+BPE+byte_fallback
 
 - 规范化：minimal/identity路线设置`tok.normalizer = None`——原文直通，大小写/重音/全角/空白/控制字符全保留；特殊token切分仍在normalizer之前按原文进行；存盘`"normalizer": null`，Rust侧`with_normalizer(None)`。
-- 预分词：
-    - 标点符号边界独立成片。连续标点符号不分开。
-    - 分离不同语言。
-    - 数字与字母/汉字等分开，但数字内部默认保持连续，不逐位切；具体 tokenizer 再根据模型和任务决定是否把长数字进一步细分。
-    - Whitespace/空白边界，不替换空格，附着后面。尾空格独立成片。
+- 预分词：[`uax29-sentence-pretokenizer.md`](./uax29-sentence-pretokenizer.md)
 
 ### 预分词方案（已验证定案）
 
-单 `Split` 配置实现上述四条（tokenizers 0.23.2 预编译轮实测，仓库零改动）：
+预分词方案的性能实测、行为规则映射、验证状态与维护方式（含单 `Split` 配置、`TOKEN_RE` 定义、性能数据、harness 全套、模型层 BPE/WordPiece/Unigram 吞吐与词表特性）已拆分至独立文档：
 
-```python
-from tokenizers import Regex
-from tokenizers.pre_tokenizers import Split
-pretok = Split(Regex(TOKEN_RE), behavior="removed", invert=True)
-```
-
-`TOKEN_RE = WS*CORE | WS+ | [\s\S]`，`CORE` 为各分支 `(X TRAIL*)+`（分支内可跨 mark 延续、分支间不互串）：`[\p{P}\p{S}]`（标点整段）、`\p{N}`（数字整段）、`[\p{Han}\p{Hiragana}\p{Katakana}\u30FC]`（CJK 组，沿用 `UnicodeScripts::fixed_script` 假名并入语义）、135 脚本全枚举（由 `scripts.rs` 离线生成）、兜底 `\p{L}`；`TRAIL=(?:\p{M}|\u200D)*`（结合符/ZWJ 跟前片）；`WS=(?:\s|\u3000)`；末分支 `[\s\S]` 兜底 guarantee tiling（出现即独立成片，永不静默丢字符）。完整正则见 `/tmp/opencode/pretok_cmp/token_v2.json`（4818 字符，136 分支，一次编译约 2ms）。
-
-规则映射（均为实测）：标点独立连续合并（`ab!!cd→[ab,!!,cd]`，`你好，世界！！→[你好，，世界，！！]`）；语言分离（`Hello你好→[Hello,你好]`，真泰老 `U+0E01/U+0E81`、真亚美尼亚/格鲁吉亚 `U+0570/U+10D2` 码点已验分开）；数字分离内部连续（`abc123你好456`，20 位长数字整片留给 Model，`1️⃣` 整体）；空格贴后不替换（`a  b→[a,  b]`，`hi →[hi, ]` 尾空格独立，`"   "` 整体保留，跨语言 `Hello 你好→[Hello, 你好]`）。
-
-共享字符行为（确定性三规则：同脚本延续、Common 恒断裂、TRAIL 向前）：同脚本共享融合（中日汉字、拉丁各语言）；同形异码按码点切（拉丁 A/西里尔 А）；Common 作防火墙（`ABC123あいう→[ABC,123,あいう]`，`3.14→[3,.,14]` 按规则字面拆分）。
-
-关键否定结论：`Sequence` 拼装不可用——`UnicodeScripts` 吞纯空白片（`pre_tokenizer.rs` 单点 `windows(2)` 为空）致丢数据，且跨片无法合并附着；单 `Split` 以 token 正则一次成形，无此问题。另：`onig` 的 `\p{脚本名}` 须逐个行为鉴别（编译通过≠正确），harness 对测试串加 `unicodedata` 码点卫生断言（曾抓出泰老/亚美尼亚同形字污染）。
-
-性能（release 轮，含 FFI）：中位数约 6.2/5.2/4.0 MiB/s（1KB/100KB/1MB），约为小正则版 80%，1.7× 于 Sequence 版；正确性门 34 用例零失败 + 全语料 tiling。
-
-验证状态（2026-09，tokenizers 0.23.2 / onig 引擎 / token_v2.json 已固化）：正确性门 34 用例零失败 + 全语料 tiling；同步检查 `sync_check.py` 通过（135 脚本无漂移）。
-
-后续维护：`tokenizers` 升级或 Unicode 数据更新后跑 `python3 sync_check.py`（退出码 0 同步 / 1 有新增 / 2 有删除）；新增脚本出现则重跑 `v2.py` 重生成 + `v2eval.py` 全门禁，通过才更新 `token_v2.json`。wasm/fancy-regex 引擎仅在有 wasm 路线图时验证（服务端默认 onig 已覆盖），届时用 `/tmp/opencode/pretok_fancy/` 方案（fancy 单构建 + 录制基线 diff）执行。
-
-harness 全套：`/tmp/opencode/pretok_cmp/`（`run.py/v2.py/v2eval.py/sync_check.py/probe*.py` + `corpus.json/results*.json/token_v2.json`）。
+- 性能测试专用文档：[`pretok-performance.md`](./pretok-performance.md)
 
 
 ## 10. 交接

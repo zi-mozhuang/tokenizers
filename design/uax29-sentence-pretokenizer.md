@@ -1,184 +1,187 @@
-# 设计方案 v3（定稿）：SentenceSplit —— 基于 Unicode UAX #29 的无损句子预分词器
+# 设计方案：UAX #29 句界 + 语言/数字/空白分类的无损预分词（单 `Split` 节点）
 
-> v1：ICU4X 段落+句子两级方案（复杂）
-> v2：正则组合主路径 + 兜底模块（正则保真度不足，否决）
-> **v3（本版）**：单模块 `SentenceSplit`，直接输出 UAX #29 默认（root）句子分割，
-> 遵循标准的一切默认行为，不做任何自定义裁剪。核心代码约 15 行。
+> **目标**：单节点完成 ① UAX #29 句界 ② 语言分离 ③ 数字独立且内部连续 ④ 空白不删、附着后面。
+> **硬约束**：不增删改任何字符（splits 拼接 == 输入，offsets 无损回原文）。
+> **结论**：`Split` 加可选布尔字段 `sentence_breaks`，内部走 `PreTokenizedString::split` 的**递归通道**——先在句界切片，再在每句内跑 `CLASS_REGEX` + `MergedWithNext`。
+> 句界因此是结构性边界，逐例等价于两级 `Sequence([SentenceSplit, Split])`，UAX #29 句界零损失。全部切点由 `slice(Range::Normalized(a..b))` 构造，无损性由构造保证。
+
+## 0. 关键决策
+
+| 项 | 决策 |
+|----|------|
+| 句界承载 | `Split` 内部两级递归；不用正则表达、不揉进 run 列表 |
+| 句界来源 | `unicode-segmentation::split_sentence_bound_indices`（SB1–SB16） |
+| 句界空白 | 并入前句（SB11），由内层 gap 朝前粘自然满足 |
+| 空白 | 不替换，写进 match 前缀；**不得**拆成独立 `WS+` 分支（会破坏 SB11 形态） |
+| 标点/组合符/emoji | 默认归前段（`merged_with_next`），与 SB9 方向一致 |
+| 数字 | 独立类、内部连续；数字内标点（`3.14`）是自由选项，两种都无损 |
+| 脚本 | 按 Script 变化切分；白名单**可闭合**（偏差 ④） |
+| 段落层级 | 放弃（UAX #29 无 paragraph） |
+| 泰文/高棉文隐式句界 | 不在范围（标准的词典模型只用于 word 界） |
+
+**已否决**：① ICU4X（依赖链 + feature 会改 `PreTokenizerWrapper` 的 serde 形状）；② 用一条正则表达句界（SB8 需无界前瞻、SB8a–SB11 有状态，且 `U.S.A.` 与 `left.Now` 字符级同形）；③ 把句界揉进 run 列表（见 §1）；④ 独立 `ClassSplit` 模块（一条正则已等价）；⑤ 两级 `Sequence`（等价，仅多一个节点，保留作等价性测试参照）。
+
+> **代价**：BERT 的 `BertPreTokenizer`、GPT-2 的 `ByteLevel` 在无损约束下都不可复刻；本管线定位为字符级 / Unigram / CJK 优先、需保留原文 offsets 的场景。
+
+## 1. 为什么句界必须放在递归层
+
+`Pattern::find_matches` 产出 run 列表（`pattern.rs:63-83`），`NormalizedString::split` 按 behavior 对**整份列表**折叠（`normalizer.rs:694-783`）：`MergedWithNext` 让 match 吸收右侧 gap，`MergedWithPrevious` 吸收左侧 gap，`Contiguous` 合并同 flag 邻 run，`Removed` 丢 match。故"pattern 内部构造的边界"可能被跨越。
+
+而 `PreTokenizedString::split`（`tokenizer/pre_tokenizer.rs:73-103`）逐层递归，**层间边界物理上不可跨越**。
+
+```
+"a\r\nb\n\nc"      UAX 句界 {1,3,4,5,6}
+  run 列表融合  →  "a\r\n" | "b\n" | "\n" | "c"        边界 {3,5,6}   ← 丢 1、4
+  逐句递归      →  ["a"]["\r\n"]["b"]["\n"]["\n"]["c"]  全保住
+```
+
+原因：句子 `"\r\n"` 只有一个 gap run，`MergedWithNext` 让前句末尾的 match 把它吸走；整句无 match 可"提升"，无法打补丁（谎报 flag 需同时禁 4 种 behavior，不值得）。分句口径按 `sentence.rs:110-124`，**须先实测定口径**。
+
+**句内**仍靠 gap 朝前粘：`abc!你好` → match `abc` 吸收 gap `!`，段界落在每个 match 起点；`abc 你好` → 空格写进 match 前缀，随 match 落到后一段。于是 ①③ 由"脚本分支 + 空白前缀"实现，② 由数字独立分支实现，标点归前段自动成立。
+
+不用 `UnicodeScripts`/`Sequence` 拼装：前者把空格映射为 `Any` 并恒吸入**前** run（与规则 ③ 相反）；后者存在下游对纯空白 split 的 `windows(2)` 为空导致的数据丢失路径。
+
+## 2. 内层 pattern
+
+```json
+{"type": "Split",
+ "pattern": {"Regex": "\\p{White_Space}*(?:[\\p{Han}\\p{Hiragana}\\p{Katakana}\\u30FC]+(?:[^\\p{White_Space}\\p{L}\\p{N}]*[\\p{Han}\\p{Hiragana}\\p{Katakana}\\u30FC]+)*|[\\p{Latin}]+(?:[^\\p{White_Space}\\p{L}\\p{N}]*[\\p{Latin}]+)*|\\p{N}+(?:[^\\p{White_Space}\\p{L}]*\\p{N}+)*)"},
+ "behavior": "MergedWithNext", "invert": false, "sentence_breaks": true}
+```
+
+```
+CLASS_REGEX = \p{White_Space}* (?: X_HAN | X_LATIN | X_NUM )
+X_HAN   = [\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+ (?: JUNK* [Han/Kana/\u30FC]+ )*
+X_LATIN = [\p{Latin}]+                            (?: JUNK* [\p{Latin}]+ )*
+X_NUM   = \p{N}+ (?: [^\p{White_Space}\p{L}]* \p{N}+ )*
+JUNK    = [^\p{White_Space}\p{L}\p{N}]
+```
+
+- `\p{White_Space}*` = 规则 ③；引擎不支持该属性名时用显式类 `[\t\n\r\f\v\x{20}\x{85}\x{A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}]`。
+- `JUNK` ≈ `Script::Common`/符号/emoji 的"非空白非字母非数字"刻画；`(?:JUNK* S+)*` 让同类 run 内的标点/组合符被吸收。
+- **两个必须写死的细节**：`X_LATIN`/`X_HAN` 的 JUNK 要排除 `\p{N}`（否则 `abc123def` 被吞成单 match）；不得用 `[\p{L}]` 兜底（否则汉字被吞进拉丁 run）。
+
+代表用例（同时是须对外公布的偏差清单）：
+
+| 输入 | 输出 | 备注 |
+|---|---|---|
+| `价格是 100 元` / `Hello world` | `["价格是"," 100"," 元"]` / `["Hello"," world"]` | ③+①② |
+| `3.14 and 1.5.2` / `1,000元` | `["3.14"," and"," 1.5.2"]` / `["1,000","元"]` | ② |
+| `你好。abc` / `他说：你好` / `どこで生れ` | `["你好。","abc"]` / 单段 / 单段 | 标点归前段；Common 吸收；kana→Han |
+| `abc  ` | `["abc  "]` | 偏差 ② 末尾空白并回前段（= SB11） |
+| `。abc` | `["。","abc"]` | 偏差 ① 句内作用域首部自成一段；与 `abc。你好` 不可兼得 |
+| `see 👨‍👩‍👧 done` | `["see 👨‍👩‍👧"," done"]` | 偏差 ③ 空白跟非字母内容时朝前 |
+| 泰文段+天城文段相邻 | 单段 | 偏差 ④ 白名单；可闭合（135 分支，约 4.8k 字符，损失 ~20% 吞吐 + `sync_check.py`） |
+
+## 3. 实现
+
+`tokenizers/src/pre_tokenizers/split.rs`：
+
+1. `Split` 加 `#[serde(default, skip_serializing_if = "is_false")] pub sentence_breaks: bool`（`fn is_false(b: &bool) -> bool { !*b }`）；`SplitHelper` 加同名字段（旧 JSON 仍可反序列化）；`Split::new` 签名不变；`Clone`（`:61-65`）/`PartialEq`（`:67-73`）带上该字段。
+2. `pre_tokenize` 分流 + 新增 `sentence_aware_segments`。
+
+```rust
+use crate::tokenizer::normalizer::Range;
+use crate::tokenizer::NormalizedString;
+use unicode_segmentation::UnicodeSegmentation;
+
+impl PreTokenizer for Split {
+    fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
+        if self.sentence_breaks {
+            return pretokenized.split(|_, normalized| {
+                sentence_aware_segments(&normalized, &self.regex, self.behavior)
+            });
+        }
+        if self.invert {
+            pretokenized.split(|_, n| n.split(Invert(&self.regex), self.behavior))
+        } else {
+            pretokenized.split(|_, n| n.split(&self.regex, self.behavior))
+        }
+    }
+}
+
+/// 外层 UAX #29 句界；内层每句跑原 pattern + behavior
+fn sentence_aware_segments(
+    normalized: &NormalizedString,
+    regex: &SysRegex,
+    behavior: SplitDelimiterBehavior,
+) -> Result<Vec<NormalizedString>> {
+    let mut starts: Vec<usize> =
+        normalized.get().split_sentence_bound_indices().map(|(i, _)| i).collect();
+    starts.push(normalized.get().len());
+    starts.dedup(); // 防御零长句 → 空 split
+
+    let mut splits = Vec::with_capacity(starts.len());
+    for w in starts.windows(2) {
+        if w[0] == w[1] { continue; }
+        let sentence = normalized.slice(Range::Normalized(w[0]..w[1]))?;
+        splits.extend(sentence.split(regex, behavior)?);
+    }
+    Ok(splits)
+}
+```
+
+`sentence.rs` 也应同步补 `dedup`。不触碰 `normalizer.rs`，不新增 `Pattern`，不改 `SplitPattern`。
+
+- **等价性**：与 `Sequence([SentenceSplit, Split])` 的句子区间、内层调用序列、slice 对齐完全一致 ⇒ 含 offsets 逐例相等。收益只是少一个 JSON 节点；性能收益为个位数百分比。
+- **约束**：`behavior` 五种皆可用（`Removed` 与无损前提冲突）；`invert` = 句内取反；`sentence_breaks=false` 零回归；`pattern` 作用域收窄为句内，须写入文档。
+- 句界在 `PreTokenizedString` 中间态不可见；需要"句子"当一等片段时用 §4 的可选注册。
+
+## 4. 绑定
+
+`PySplit::new`（`bindings/python/src/pre_tokenizers.rs:420-433`）加参数，同步 getter/setter 与 docstring：
+
+```rust
+#[pyo3(signature = (pattern, behavior, invert = false, sentence_breaks = false),
+      text_signature = "(self, pattern, behavior, invert=False, sentence_breaks=False)")]
+```
+
+Node 加工厂参数并同步 `lib/` 的 TS 声明。**不要手改生成的 `.pyi`**（`make check-style` 会重生成）。测试放 `bindings/python/tests/bindings/test_pre_tokenizers.py`（JSON 往返 + 旧配置兼容 + 行为断言）。建议 binding 侧把 `CLASS_REGEX` 固化为常量。
+
+可选：`sentence.rs` 已实现但**未注册**（`mod.rs:1-11` 与 `PreTokenizerWrapper:30-43` 均缺），只需单节点时不必注册；需要句子一等片段时再补 `mod.rs` 7 处 + Python 4 处。
+
+## 5. 测试
+
+1. **无损 property**：拼接 == 输入；两个 referential 的 offsets 连续、单调、无重叠、并集 == 全串；无空 split。覆盖空串/纯空白/纯分隔符/多语言/emoji-ZWJ/组合符/随机 UTF-8；`sentence_breaks` 三态各跑一次。
+2. **句界三断言**：段界集合 ⊇ 句界；无段落跨越句界；与 `Sequence` 参照逐例相等（含 offsets）。必须含 §1 的反例 `"a\r\nb\n\nc"`。
+3. **标准一致性**：`make data/SentenceBreakTest.txt` 逐条比对 `÷`/`×`；本方案可写"恰好相等"（run 列表融合方案只能写"⊇"）。
+4. **前置实测**：`split_sentence_bound_indices` 对 `"a\r\nb\n\nc"`、`"段一。\n\n段二。"` 的输出，统一与 `sentence.rs` 的口径。
+5. **规则矩阵 + 双引擎**：§2 表全部用例 + 多语言 golden（中/英/日/韩/藏/印地/法 NBSP/阿拉伯/CRLF/`\u{2028}`）；`onig` 下**逐脚本逐分支行为鉴别**取 golden（"编译通过 ≠ 正确"），`unicodedata` 码点卫生断言防同形异码，fancy-regex 用录制基线 + diff。
+6. **性能**：release、含 FFI、1KB/100KB/1MB 中位数，三方对比 `sentence_breaks=false` / `=true` / 两级 `Sequence`。
+
+## 6. 风险
+
+1. **SB6/SB7/SB5 无法保证**（两级方案同样不能，唯一语义缺口）：`3.14` 不吸收 `.` 会被切三片（SB6，由 `X_NUM` 覆盖）；`U.S.A.` 与 `left.Now` 同形，上下文无关的正则只能二选一（SB7，作为已声明偏差）；跨脚本吸收失败 `"a\u{0301}你"`（SB5，可用切点吸附到 `grapheme_indices` 加固）。
+2. **`Split` 语义收窄**：`pattern` 作用域变成句内；靠文档 + 等价性断言兜住。
+3. **口径未实测**：`sentence.rs` 与旧文档对换行归属矛盾，先实测再写断言。
+4. **脚本白名单**（偏差 ④）：可闭合但需维护（离线生成 + `sync_check.py`，退出码 0/1/2）。
+5. **`\p{...}` 零先例 + `\p{N}` 口径**：属性表版本由引擎决定，可能与 `scripts.rs` 不一致（靠逐脚本鉴别 + golden 锁定）；`\p{N}` = `Nd|Nl|No`，与 `char::is_numeric()` 一致（`½`/`²`/`Ⅻ` 也算数字，同 `digits.rs`），要严格十进制需换 `\p{Nd}` 并声明偏离。
+6. 泰文/高棉文隐式句界不在范围；`CLASS_REGEX` 与 `Digits`/`UnicodeScripts`/`Punctuation` 语义重叠，文档须说明本配置是这三者的无损替代，避免叠加互相抵消。
+
+## 7. 性能优化
+
+基线（实测，136 分支大正则 + 单节点，含 FFI）：6.2 / 5.2 / 4.0 MiB/s；编译约 2ms。**分支数不是主要矛盾**（136 分支只慢约 20%，不值得退回白名单），**趟数是**（多节点 `Sequence` 仅单节点约 47%），且吞吐随输入变大而下降 ⇒ 瓶颈在分配与缓存局部性，不在 FFI。
+
+| 档 | 动作 | 预估 |
+|---|---|---|
+| 1 | 正则线性化 `S (?:JUNK*S)*` → `(X TRAIL*)+`（`JUNK*` 是回溯源）；交替分支按频率排序 | 12~35% |
+| 1 | 廉价预筛（句内无标点/数字/异脚本则整体成段）；无 SATerm 时跳过句界扫描 | 10~40% |
+| 2 | 去掉句子级中间对象（按全局 offsets 一次 slice）；按句界分块处理长输入 | 10~30% |
+| 3 | 下游：保持 `MergedWithNext`（split 数最少）、BPE `cache`、`encode_batch`、truncation early-exit | 可达数倍 |
+
+**禁止**：拆空白分支、用 `(?>...)`/占有量词（加剧双引擎差异）、为性能改写字形。**守卫**：先 profile 定位（`find_matches` / fold+slice / Model / FFI），1、2 档每步都过 §5 的断言与 golden。
+
+## 8. 实施步骤
+
+0. 实测分句口径（§5.4），统一文档与 `sentence.rs`。
+1. `split.rs` 改动（§3）+ `sentence.rs` 补 `dedup`。
+2. `cargo test --lib split`：§5.1 + §5.2（含反例）。
+3. `make data/SentenceBreakTest.txt` + 一致性测试；§5.5 矩阵 + 逐脚本鉴别 + 双引擎基线。
+4. Python binding（§4）→ `maturin develop` → `pytest -k split` → `make check-style` 查 stub diff；Node（可选）。
+5. 性能三方基线，按 §7 顺序优化。
+6. 更新两套文档源（`docs/source/` 与 `docs/source-doc-builder/`，不会互相同步）：脚本白名单、§2 的偏差、风险 1 的缺口、`pattern` 作用域收窄。
+7. （可选）注册 `SentenceSplit`：`mod.rs` 7 处 + Python 4 处 + 测试。
 
 ---
 
-## 1. 设计原则（硬约束）
-
-| # | 约束 | 说明 |
-|---|------|------|
-| 1 | **无损** | 不增、不删、不改原文任何字符；所有 splits 拼接 == 原文 |
-| 2 | **遵循标准默认** | 边界位置、空白归属完全按 UAX #29 root rules，不做 tailoring |
-| 3 | **无段落层级** | UAX #29 本身不定义 paragraph，本模块也不引入 |
-| 4 | **最简化** | 零配置项、零新增依赖、单模块单节点 |
-
-## 2. UAX #29 标准行为（本模块 = 标准行为的直接映射）
-
-- **SB1/SB2**：文本首尾为天然边界；
-- **SB3**：`CR × LF` —— CRLF 视为一个单元，不拆；
-- **SB4**：每个 `Sep | CR | LF` 之后都断 —— **每个换行符自成一个 split**（无"空行才是段落"概念）；
-- **SB5**：`× Extend | Format | ZWJ` —— 组合字符、ZWJ emoji、国旗序列永远不切在中间；
-- **SB6–SB10**：缩写与数字上下文保护 —— `Mr.`、`e.g.`、`D.C.`、`3.14` 等**不切**；
-- **SB8a/SB9**：引号、括号等 Close 字符附着在其闭合的句子上 —— `「こんにちは。」` 是一个整体；
-- **SB11**：主断句规则，边界在 `SATerm Close* Sp*` **之后** —— **句间空白归入前一句末尾**。
-
-> 关键澄清：标准只定义边界位置（÷），不存在"空白独立成 token"或"并入后句"的概念；
-> MergedWithPrevious/Next/Isolated 是 tokenizers 框架的实现层概念，本模块不需要它们。
-> 有损行为（丢空白、替换 ▁、字节映射）是现有部分模块的工程选择，与本模块无关。
-
-**已知边界（标准自身的限制，不是实现缺陷）**：
-- 无 locale tailoring（希伯来文缩写等）——root rules 是 locale 无关默认规则；
-- 泰文等无空格语言的隐式句界**不在标准范围内**（词典模型只用于词界，不用于句界）；
-- 换行符各自成段（SB4），硬换行散文会在每个 `\n` 处断开——这是标准行为，有意保留。
-
-## 3. 模块设计
-
-### 3.1 依赖
-
-`unicode-segmentation = "1.11"` —— **已在 `tokenizers/Cargo.toml` 依赖树中**，零新增依赖、
-无需 feature 门控。其 `split_sentence_bound_indices` 是 UAX #29 root rules 的完整
-状态机实现，对官方 `SentenceBreakTest.txt` 一致性为 100%。
-
-### 3.2 核心实现（`tokenizers/src/pre_tokenizers/sentence.rs`，新文件）
-
-```rust
-use crate::tokenizer::{normalizer::Range, PreTokenizedString, PreTokenizer, Result};
-use crate::utils::macro_rules_attribute;
-use unicode_segmentation::UnicodeSegmentation;
-
-/// 基于 Unicode UAX #29 默认句子边界的无损预分词器。
-/// - 不增删改任何字符（splits 拼接 == 原文）
-/// - SB11：句间空白归入前句末尾；SB4：每个换行符自成 split
-/// - 缩写、引号、组合字符、ZWJ emoji 永不切开（SB5-SB10）
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[macro_rules_attribute(impl_serde_type!)]
-pub struct SentenceSplit;
-
-impl SentenceSplit {
-    pub fn new() -> Self { Self {} }
-}
-
-impl Default for SentenceSplit {
-    fn default() -> Self { Self::new() }
-}
-
-impl PreTokenizer for SentenceSplit {
-    fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
-        pretokenized.split(|_, normalized| {
-            let mut offsets: Vec<usize> = normalized
-                .get()
-                .split_sentence_bound_indices()
-                .map(|(i, _)| i)
-                .collect();
-            offsets.push(normalized.get().len());
-            Ok(offsets
-                .windows(2)
-                .map(|item| {
-                    normalized
-                        .slice(Range::Normalized(item[0]..item[1]))
-                        .expect("NormalizedString bad split")
-                })
-                .collect::<Vec<_>>())
-        })
-    }
-}
-```
-
-要点：
-- 复用与 `UnicodeScripts` 完全相同的切片机制（`pretokenized.split()` +
-  `Range::Normalized`），offsets 映射（normalized → original）由框架自动维护；
-- `split_sentence_bound_indices` 产出 grapheme 对齐的字节偏移，零长度片段不存在，
-  区间并集 == 输入 → 无损由构造保证；
-- JSON 序列化最简形态：`{"type":"SentenceSplit"}`。
-
-### 3.3 注册点（对照 `FixedLength`/`UnicodeScripts` 的既有改法）
-
-**Rust core — `tokenizers/src/pre_tokenizers/mod.rs`，6 处：**
-1. `pub mod sentence;`
-2. `use crate::pre_tokenizers::sentence::SentenceSplit;`
-3. `PreTokenizerWrapper` 枚举 + `pre_tokenize` match 分支；
-4. 反序列化 `EnumType` 加 `SentenceSplit` + 对应 match 分支；
-5. `PreTokenizerUntagged` 加变体 + 对应 match 分支；
-6. `impl_enum_from!(SentenceSplit, PreTokenizerWrapper, SentenceSplit);`
-
-**Python — `bindings/python/src/pre_tokenizers.rs`，4 处：**
-1. `use tk::pre_tokenizers::sentence::SentenceSplit;`
-2. `get_as_subtype` 加 `PreTokenizerWrapper::SentenceSplit(_) => Py::new(py, (PySentenceSplit {}, base))` 分支；
-3. 仿 `PyUnicodeScripts`（L879-889）新增 `PySentenceSplit` pyclass（无构造参数）；
-4. `#[pymodule_export] pub use super::PySentenceSplit;`
-   stub（`.pyi`）由 `make check-style` 自动生成，**不手改**。
-
-**Node — `bindings/node/src/pre_tokenizers.rs`，1 处：**
-仿 `whitespace_split_pre_tokenizer()`（L131-138）新增工厂函数：
-```rust
-#[napi]
-pub fn sentence_split_pre_tokenizer() -> PreTokenizer {
-  PreTokenizer {
-    pretok: Some(Arc::new(RwLock::new(
-      tk::pre_tokenizers::sentence::SentenceSplit.into(),
-    ))),
-  }
-}
-```
-（注：Node 侧本来就未导出全部 12 个模块——`UnicodeScripts`/`FixedLength` 也缺；
-导出 SentenceSplit 属可选增强，不做也不影响 core/Python。）
-
-## 4. 边界行为速查表
-
-| 输入 | 输出 splits | 规则依据 |
-|------|-------------|----------|
-| `Mr. Smith went.  He left.` | `["Mr. Smith went.  ", "He left."]` | SB6-8 不切缩写；SB11 空白归前句 |
-| `他说：你好。转身走了。` | `["他说：你好。", "转身走了。"]` | 。 为 STerm |
-| `彼は言った。「こんにちは。」そして去った。` | `["彼は言った。", "「こんにちは。」", "そして去った。"]` | SB8a/SB9 引号附着 |
-| `a\r\nb\n\nc` | `["a", "\r\n", "b", "\n", "\n", "c"]` | SB3 CRLF 一体；SB4 每个换行自成 split |
-| `Café 👨‍👩‍👧 done.` | 单 split，组合字符/ZWJ emoji 不切 | SB5 |
-| `3.14 is pi. 1.5.2 is not.` | `["3.14 is pi. ", "1.5.2 is not."]` | SB6/SB8 数字上下文 |
-| `Wait… what?! Really?!…` | `["Wait… ", "what?! ", "Really?!…"]` | SB9/SB11 终止符序列归并 |
-| `"末尾无终止符"` | `["末尾无终止符"]` | SB2 ÷ eot |
-
-## 5. 测试方案
-
-1. **无损 property test**（core 单元测试，随模块同文件）：空串、纯空白、文末终止符、
-   连续换行、组合字符/ZWJ emoji、多语言混排 → 断言 splits 拼接 == 原文
-   且 offsets 连续覆盖 `[0, len)`；
-2. **多语言 golden**：中/英/日/韩/藏(།)/印地(।)/法(NBSP)/阿拉伯(؟)/CRLF（见 §4 表）；
-3. **官方一致性**（可选增强）：`make data/SentenceBreakTest.txt` 下载官方用例后
-   `cargo test --test sentence_split` 逐条断言（`unicode-segmentation` 本身已 100% 通过，
-   该测试验证的是集成层不引入偏差）；
-4. **Python 测试**：`tests/bindings/test_pre_tokenizers.py` 加 JSON 序列化往返
-   （`__getstate__/__setstate__`）与 `pre_tokenize_str` 行为断言。
-
-## 6. 与现有 12 模块的关系
-
-本模块成为第 13 个 pre-tokenizer。无损性审计（哪些可与之组合）：
-
-| 可无损组合 | 有损（不可用于本约束） |
-|------------|------------------------|
-| Split（非 Removed）、Punctuation（非 Removed）、Digits、UnicodeScripts、FixedLength、Sequence | Whitespace、WhitespaceSplit、BertPreTokenizer、CharDelimiterSplit（丢字符）；ByteLevel、Metaspace（改写字符） |
-
-典型组合（句内细分，SentenceSplit 先行形成句界 barrier，后续模块只在句内运行）：
-
-```python
-from tokenizers import pre_tokenizers
-tok.pre_tokenizer = pre_tokenizers.Sequence([
-    pre_tokenizers.SentenceSplit(),      # 1. UAX #29 句界（无损）
-    pre_tokenizers.UnicodeScripts(),     # 2. 句内按 Script 细分（无损）
-    pre_tokenizers.Digits(False),        # 3. 句内数字段（无损）
-])
-```
-
-## 7. 实施步骤
-
-1. 新建 `tokenizers/src/pre_tokenizers/sentence.rs`（§3.2 代码 + §5.1/5.2 单元测试）；
-2. `tokenizers/src/pre_tokenizers/mod.rs` 注册（§3.3 Rust core 6 处）；
-3. WSL 内验证：`cd tokenizers && cargo test --lib sentence` 和
-   `cargo clippy --all-targets --all-features -- -D warnings`；
-4. Python binding（§3.3 Python 4 处）→ `maturin develop` →
-   `python -m pytest tests/bindings/test_pre_tokenizers.py -v -k sentence`；
-5. `make check-style` 重新生成 stub 并检查 diff；
-6. Node binding（§3.3 Node 1 处，可选）→ `yarn build && make test`；
-7. 文档：两套独立来源 `docs/source/`（Sphinx）与 `docs/source-doc-builder/` 需分别更新。
+关键文件：`pre_tokenizers/split.rs`（唯一改动）、`pre_tokenizers/sentence.rs`（已实现未注册）、`tokenizer/pre_tokenizer.rs:73-103`（递归边界）、`tokenizer/normalizer.rs:694-783`、`:745-766`（fold / `MergedWithNext`）、`tokenizer/pattern.rs:63-83`（run 契约）、`bindings/python/src/pre_tokenizers.rs:416-484`（`PySplit` 参照）、`Cargo.toml:84`（`unicode-segmentation` 已在依赖树）。
