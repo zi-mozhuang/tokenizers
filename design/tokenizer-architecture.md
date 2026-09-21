@@ -658,14 +658,19 @@ graph TB
 6. 兼容 HF：读写 `tokenizer.json v1.0` + `vocab.json/merges.txt`，保证 `from_file` 可加载。
 
 待确认：目标（教学原型 / 生产级 / 兼容HF）、语言（Rust从零 / Python优先 / 已有代码改）、算法（BPE / WordPiece / Unigram / WordLevel）。
+
 目标：Character-level Tokenizer+BPE+byte_fallback
 
+- 抽取特殊token：通过added_tokens提前注册
 - 规范化：minimal/identity路线设置`tok.normalizer = None`——原文直通，大小写/重音/全角/空白/控制字符全保留；特殊token切分仍在normalizer之前按原文进行；存盘`"normalizer": null`，Rust侧`with_normalizer(None)`。
 - 预分词：[`uax29-sentence-pretokenizer.md`](./uax29-sentence-pretokenizer.md)
+- 分词模型：BPE+byte_fallback
+- post_processor：with_post_processor(None)
+    1. ByteLevel(trim_offsets=true) / RobertaProcessing 都会调 process_offsets() 修 offsets，破坏 UAX29 无损约定。ByteLevel(trim_offsets=false) 虽是空操作只 set_sequence_id，但语义是 GPT-2 前空格那套，跟 CJK 优先管线无关，留它容易误导。
+    2. TemplateProcessing / BertProcessing 会自动加 CLS/SEP/bos/eos，跟“抽取注册、手动控制”冲突。教学原型先 null 跑通 raw -> split -> BPE -> Encoding -> decode 全链+offset 单测，再按需加。
+    3. 需要指令微调自动加尾词时，第二步再换 TemplateProcessing(single="$0 eos", special_tokens=[eos])，不要默认带。
 
-### 预分词方案（已验证定案）
-
-预分词方案的性能实测、行为规则映射、验证状态与维护方式（含单 `Split` 配置、`TOKEN_RE` 定义、性能数据、harness 全套、模型层 BPE/WordPiece/Unigram 吞吐与词表特性）已拆分至独立文档：
+### 方案性能测试
 
 - 性能测试专用文档：[`pretok-performance.md`](./pretok-performance.md)
 
