@@ -57,6 +57,31 @@
 
 共享字符行为（确定性三规则：同脚本延续、Common 恒断裂、TRAIL 向前）：同脚本共享融合（中日汉字、拉丁各语言）；同形异码按码点切（拉丁 A/西里尔 А）；Common 作防火墙 `ABC123あいう→[ABC,123,あいう]`、`3.14→[3,.,14]` 按规则字面拆分。
 
+### JUNK 拖尾条件：保留 vs 去掉（实测，2026-09-22）
+
+上句"标点落在 JUNK 拖尾内"指 CLASS_REGEX 三类各自后面的拖尾组
+`(?:[^\p{White_Space}\p{L}\p{N}]* [CLASS]+)*`（注意外层的 `*` 循环）。它做两件事：
+1. 单次拖尾吸收**一个**尾随标点进类 run（`Hello,`/`No.`/`123.` 保留尾标点）；
+2. `*` 循环允许"类 run 被标点打断后继续"——`U.S.`、`a.b`、`U.S.A.` 整体成片，而非碎成 `U.`/`S.`、`a.`/`b`。
+
+去掉这三个拖尾组（纯类 run `[\p{Latin}]+` 等）即"无拖尾"变体：`MergedWithNext` 仍把标点贴到后一词，但**每次标点都硬切类 run**（`U.S.`→`U.`/`S.`）。
+
+两变体用完全一致口径（全量 270MB 流式、30k BPE、min_frequency=2、byte_fallback、相同 corpus alphabet）训练，压缩率测于统一分层抽样 8.15M 字符。评测脚本 `dataset/pretok_cmp/cmp_junktrail.py`，产物 `tokenizer_C2_noJUNK.json`、`results_cmp_junktrail.json`：
+
+| 变体 | 预分词吞吐(1KB/100KB/1MB MiB/s) | 片段/1k字符 | chars/token | 与生产 C3 词表重合 |
+|---|---|---|---|---|
+| 含条件（C2，标点吸进类 run、run 可被打断续接） | 15.25 / 10.14 / 8.78 | 133.0 | **3.1993** | 26568 |
+| 无拖尾（纯类 run，标点每处硬切） | 15.38 / 10.03 / 7.44 | 157.7 | 3.1524 | 26862 |
+| 生产 C3（TOKEN_RE+removed+invert） | 9.38 / 6.53 / 5.21 | 210.7 | 2.9993 | — |
+
+> 吞吐为 `pre_tokenize_str` 纯正则开销，绝对值随机器负载浮动（仅看相对差）；chars/token 与 `pretok-performance.md` 横评的 C2=3.199 一致（本运行复现 3.1993）。
+
+结论：
+- **压缩**：保留拖尾条件比去掉好 **约 1.5%**（3.1993 vs 3.1524，多 ~38k token）。该条件**并非中性**——它让 `U.S.`/`a.b`/`D.C.`/`i.e` 这类"词+内/尾标点"成为稳定词表项，减少标点碎片。
+- **吞吐**：去掉拖尾组对正则速度几乎无影响（1KB 档 15.25→15.38，<1%）；代价是粒度更碎（+18% 片段数）。
+- **词表**：两方案仅 **1389 个词（4.6%）不同**，差异几乎全是标点附着方式——仅存于 WITH 的 1389 中有 1152 含标点、仅存于 WITHOUT 的有 863 含标点。去掉拖尾反而使词表**略**贴近生产（多 294 项重合），但压缩更差。
+- **决策**：保留 JUNK 拖尾组（即当前 `CLASS_REGEX` 定义）。
+
 ---
 
 ## 4. 序列化与兼容
@@ -128,7 +153,7 @@ pretok = Split(Regex(CLASS_REGEX), behavior="merged_with_next")
 2. **离线阻断 `make check-style` 的 stub-gen**：`tools/stub-gen` 需联网拉 crates，离线时只能手改 `.pyi`，合并前务必本地跑 `make check-style` 覆盖。
 3. **onig 的 `\p{}` 属性需逐个鉴别**：编译通过 ≠ 语义正确；本方案的属性名在 vendored oniguruma 中实测存在，但换引擎（fancy-regex/wasm）需重验。
 4. **`byte_fallback` 训练期无效**：这是 0.23.x 的发布轮坑，训练侧覆盖率只能靠 `initial_alphabet`，示例脚本据此设计。
-5. **`MergedWithNext` 合并方向影响断言**：它把每个 match 与其**前置** gap 合并，尾随 gap 成为独立 piece；测试若直接比对 span 会误判，应改为「无损 + 去空白后核心 token 顺序」或「句界包含性」断言。
+5. **`MergedWithNext` 合并方向影响断言**：它把每个 match 与其**后置** gap 合并（match + 紧跟其后的分隔符/空白），**前置** gap 成为独立 piece；例如 `Hello, world!` → `['Hello,', ' world!']`、`'U.S.'→['U.S.']`（含拖尾组）vs `['U.', 'S.']`（无拖尾组）。测试若直接比对 span 会误判，应改为「无损 + 去空白后核心 token 顺序」或「句界包含性」断言。
 6. **内存安全**：BPE 训练必须**流式** `train_from_iterator(逐行)`，整份语料常驻 + trainer 词频表曾触发 OOM 并清空 `/tmp` 工作区；每配置**独立进程**训练/测量，退出即释放内存（单程峰值 ~2.5GB）。
 7. **工作区持久化**：脚本/词表落在仓库 `dataset/pretok_cmp/`，并 `sys.path.insert(0, bindings/python/py_src)` 直接导入 `tokenizers`，不依赖 `.venv`。
 

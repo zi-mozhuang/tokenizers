@@ -650,15 +650,6 @@ graph TB
 
 ## 9. 自研 tokenizer 准备：最小路径建议
 
-1. 定接口：`normalize(text)->str+align / pre_tokenize->Vec<Span> / tokenize(span)->Vec<Token{id,value,offsets}> / post_process / decode`，先抄五 trait 形状。
-2. 先实现 `WordLevel`（精确查表）打通 `raw -> normalize -> split（空白/标点） -> 查表 -> Encoding{ids,offsets} -> decode` 全链 + offset 还原单测。
-3. 再加 `BPE` 或 `WordPiece` 二选一：BPE 需 pair rank 表 + 合并堆 + cache；WordPiece 仅贪心最长匹配，代码量小，推荐起步。
-4. 再加 `AddedVocabulary` trie（可用 regex / Aho-Corasick 先替代 `DoubleArrayAhoCorasick`）+ `TemplateProcessing` + `truncate/pad`。
-5. Trainer 最后：`feed 计数 -> 按频次/确定性排序建词表 -> 合并`，BPE 堆逻辑最复杂，单测用小语料对拍 HF 输出。
-6. 兼容 HF：读写 `tokenizer.json v1.0` + `vocab.json/merges.txt`，保证 `from_file` 可加载。
-
-待确认：目标（教学原型 / 生产级 / 兼容HF）、语言（Rust从零 / Python优先 / 已有代码改）、算法（BPE / WordPiece / Unigram / WordLevel）。
-
 目标：Character-level Tokenizer+BPE+byte_fallback
 
 - 抽取特殊token：通过added_tokens提前注册
@@ -673,7 +664,6 @@ graph TB
 ### 方案性能测试
 
 - 性能测试专用文档：[`pretok-performance.md`](./pretok-performance.md)
-
 
 ## 10. 交接
 
