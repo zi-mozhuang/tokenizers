@@ -1,190 +1,75 @@
-# 字符类 + Split 预分词方案（最终版，无句界）
+# C2 字符类 + Split 预分词（最终版）
 
-> 本文档为最终方案，替代有句界版 `design/uax29-sentence-breaks-split.md`。
-> 最终配置 **不使用句界层**：`Split(Regex(CLASS_REGEX), behavior="merged_with_next")`。
-> 句界扩展 `sentence_breaks` 已实现并验证（见 §10），但经横向评测判定为「压缩中性 + 吞吐负收益」，故默认关闭、不纳入最终管线。
-
----
-
-## 0. 一句话结论
-
-预分词 = 单个 `Split` + 字符类正则 `CLASS_REGEX` + `behavior="merged_with_next"`：按「汉字组 / 拉丁 / 数字」三大类切分，类内允许拖尾非类字符延续（标点、组合符、ZWJ 等），类间不互串。不引入句界层，故也无需 UAX #29。
-
-- 改动面：仅 `CLASS_REGEX` 的定义与 `Split` 的常规配置；不新增类型、模块或序列化字段。
-- 不动：`sentence.rs` / `mod.rs` / Node binding；序列化沿用 `Split` 既有 `to_str()/from_file`。
-
----
-
-## 1. 目标与动机
-
-1. **字符类分离**：中日韩 / 拉丁 / 数字各成 run，避免中英文或数字混入同一 token。
-2. **复用现有 `Split`**：plain `SysRegex`，最小改动、向后兼容、天然可序列化。
-3. **可序列化**：产出的 `tokenizer.json` 必须能被 `Tokenizer.from_file` 还原（硬约束）。
-
----
-
-## 2. pattern（CLASS_REGEX）
-
-文档 §2 给出的字符类正则，作为 `behavior=MergedWithNext`、`invert=false` 的识别器：
-
-```
-\p{White_Space}*
-(?:
-  [\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+
-    (?:[^\p{White_Space}\p{L}\p{N}]*[\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+)*
-| [\p{Latin}]+
-    (?:[^\p{White_Space}\p{L}\p{N}]*[\p{Latin}]+)*
-| \p{N}+
-    (?:[^\p{White_Space}\p{L}]*\p{N}+)*
-)
-```
-
-**两个必须锁进断言的细节**（测试覆盖，违反即行为错误）：
-
-1. **JUNK 排除 `\p{N}`**：否则 `abc123def` 会被 JUNK（`[^…\p{N}]*` 不含数字）切断后的数字再接回，塌缩成单 match。
-2. **不得用 `[\p{L}]` 兜底**：否则汉字会被吞进 Latin run（中英文不分离）。
-
-`\p{White_Space}` / `\p{Han}` / `\p{Latin}` / `\p{Hiragana}` / `\p{Katakana}` 等属性名在仓库 vendored 的 **oniguruma**（默认 feature `onig`）属性表中已确认存在，无需降级为显式空白类或脚本枚举。
-
----
-
-## 3. 行为规则映射（均为实测）
-
-- 语言分离：`Hello你好→[Hello,你好]`；真泰老 `U+0E01/U+0E81`、亚美尼亚/格鲁吉亚 `U+0570/U+10D2` 码点已验分开。
-- 数字连续内部：`abc123你好456`，长数字整片留给 Model，`1️⃣` 整体。
-- 空格贴后不替换：`a  b→[a,  b]`、`hi →[hi, ]` 尾空格独立、跨语言 `Hello 你好→[Hello, 你好]`。
-- 标点：本方案按三大类粗切，标点落在 JUNK 拖尾内（与生产版 `token_v2.json` 的脚本/标点分支语义一致，但本方案不枚举全部脚本）。
-
-共享字符行为（确定性三规则：同脚本延续、Common 恒断裂、TRAIL 向前）：同脚本共享融合（中日汉字、拉丁各语言）；同形异码按码点切（拉丁 A/西里尔 А）；Common 作防火墙 `ABC123あいう→[ABC,123,あいう]`、`3.14→[3,.,14]` 按规则字面拆分。
-
-### JUNK 拖尾条件：保留 vs 去掉（实测，2026-09-22）
-
-上句"标点落在 JUNK 拖尾内"指 CLASS_REGEX 三类各自后面的拖尾组
-`(?:[^\p{White_Space}\p{L}\p{N}]* [CLASS]+)*`（注意外层的 `*` 循环）。它做两件事：
-1. 单次拖尾吸收**一个**尾随标点进类 run（`Hello,`/`No.`/`123.` 保留尾标点）；
-2. `*` 循环允许"类 run 被标点打断后继续"——`U.S.`、`a.b`、`U.S.A.` 整体成片，而非碎成 `U.`/`S.`、`a.`/`b`。
-
-去掉这三个拖尾组（纯类 run `[\p{Latin}]+` 等）即"无拖尾"变体：`MergedWithNext` 仍把标点贴到后一词，但**每次标点都硬切类 run**（`U.S.`→`U.`/`S.`）。
-
-两变体用完全一致口径（全量 270MB 流式、30k BPE、min_frequency=2、byte_fallback、相同 corpus alphabet）训练，压缩率测于统一分层抽样 8.15M 字符。评测脚本 `dataset/pretok_cmp/cmp_junktrail.py`，产物 `tokenizer_C2_noJUNK.json`、`results_cmp_junktrail.json`：
-
-| 变体 | 预分词吞吐(1KB/100KB/1MB MiB/s) | 片段/1k字符 | chars/token | 与生产 C3 词表重合 |
-|---|---|---|---|---|
-| 含条件（C2，标点吸进类 run、run 可被打断续接） | 15.25 / 10.14 / 8.78 | 133.0 | **3.1993** | 26568 |
-| 无拖尾（纯类 run，标点每处硬切） | 15.38 / 10.03 / 7.44 | 157.7 | 3.1524 | 26862 |
-| 生产 C3（TOKEN_RE+removed+invert） | 9.38 / 6.53 / 5.21 | 210.7 | 2.9993 | — |
-
-> 吞吐为 `pre_tokenize_str` 纯正则开销，绝对值随机器负载浮动（仅看相对差）；chars/token 与 `pretok-performance.md` 横评的 C2=3.199 一致（本运行复现 3.1993）。
-
-结论：
-- **压缩**：保留拖尾条件比去掉好 **约 1.5%**（3.1993 vs 3.1524，多 ~38k token）。该条件**并非中性**——它让 `U.S.`/`a.b`/`D.C.`/`i.e` 这类"词+内/尾标点"成为稳定词表项，减少标点碎片。
-- **吞吐**：去掉拖尾组对正则速度几乎无影响（1KB 档 15.25→15.38，<1%）；代价是粒度更碎（+18% 片段数）。
-- **词表**：两方案仅 **1389 个词（4.6%）不同**，差异几乎全是标点附着方式——仅存于 WITH 的 1389 中有 1152 含标点、仅存于 WITHOUT 的有 863 含标点。去掉拖尾反而使词表**略**贴近生产（多 294 项重合），但压缩更差。
-- **决策**：保留 JUNK 拖尾组（即当前 `CLASS_REGEX` 定义）。
-
----
-
-## 4. 序列化与兼容
-
-```rust
-pub fn new(pattern, behavior, invert: bool) -> Split  // 默认 invert=false
-```
-
-向后兼容：旧 `tokenizer.json` 反序列化无 `sentence_breaks` 字段时默认 `false`（即使存在该字段，本方案也不启用）。`Clone` / `PartialEq` 维持原样。
-
----
-
-## 5. Python 绑定
+**定案**：最终路径是 C2 `CLASS_REGEX` + 普通 `Split`，不启用句界层：
 
 ```python
 from tokenizers import Regex
 from tokenizers.pre_tokenizers import Split
-pretok = Split(Regex(CLASS_REGEX), behavior="merged_with_next")
+pretok = Split(Regex(CLASS_REGEX), behavior="merged_with_next", invert=False)
 ```
 
-> **注意**：`.pyi` 类型桩由 `make check-style`（`tools/stub-gen`）自动生成。在**离线**环境无法联网拉取 stub-gen 依赖时，需手动同步 `py_src/tokenizers/pre_tokenizers.pyi` 的 `Split` 签名；合入主分支前应跑一次 `make check-style` 覆盖手改。
+当前 Rust `Split` 只序列化 `pattern`、`behavior`、`invert`，没有 `sentence_breaks` 字段。C1 的句界实现只保留为历史 benchmark；C3 大正则只作性能参照。下方 Python API 以 `tokenizers==0.23.2` 验证路径为准；当前 checkout 的 Python binding 源码未导出这组预分词 API，默认构建也未提供该正则后端。
 
----
+## 1. 最终 `CLASS_REGEX`
 
-## 6. 目标管线示例（示例脚本）
+`behavior="merged_with_next"`、`invert=false`；最终正则如下：
 
-`bindings/python/examples/train_uax29_bpe.py` 组装如下目标管线并断言落盘与往返无损：
+```python
+CLASS_REGEX = (
+    r"\p{White_Space}*"
+    r"(?:"
+    r"[\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+"
+    r"(?:[^\p{White_Space}\p{L}\p{N}]*[\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+)*"
+    r"|[\p{Latin}]+"
+    r"(?:[^\p{White_Space}\p{L}\p{N}]*[\p{Latin}]+)*"
+    r"|\p{N}+"
+    r"(?:[^\p{White_Space}\p{L}]*\p{N}+)*"
+    r")"
+)
+```
 
-| 组件 | 取值 | 说明 |
-|---|---|---|
-| `normalizer` | `None` | 原文直通，大小写/重音/全角/空白/控制字符全保留 |
-| `pre_tokenizer` | `Split(CLASS_REGEX, merged_with_next)` | 字符类切分（无句界） |
-| `model` | `BPE(byte_fallback=True, unk_token="<unk>")` | 字节回退兜底 |
-| `post_processor` | `None` | 留给调用方第二步的 bos/eos/template |
-| `decoder` | `Sequence([ByteFallback(), Fuse()])` | 推理期还原 |
+以上是相邻字符串拼接后的最终正则；换行和缩进只属于 Python 源码，不得进入 pattern。
 
-### 关键经验：`byte_fallback` 是**推理期**属性
+三类显式 run：汉字/假名、拉丁、数字。JUNK 允许标点、组合符、ZWJ，并在同类再次出现时接回；类间不互串。两个约束不能改：汉字/拉丁分支的 JUNK 必须排除 `\p{N}`，否则 `abc123def` 会塌缩；不能用 `[\p{L}]` 兜底，否则汉字会进入 Latin run。数字分支刻意允许数字继续，因此 `3.14` 保持一个数字 run。
 
-- `BpeTrainer` **不接受** `byte_fallback` 选项，其 `initial_alphabet` 只取每项**首字符**，无法注入 256 个 `<0xXX>` 字节 token。
-- 因此训练侧覆盖率**只能**靠 `initial_alphabet = sorted(语料字符集)` 保证（示例脚本即如此）；`byte_fallback=True` 仅作推理期安全网。
-- 若需真正覆盖任意字节，应在训练后做 `tokenizer.json` 手术：注入 `<0x00>`..`<0xFF>` 并把 `model.byte_fallback=true`，再 `from_file` 重建。
-- 统一用 `unk_token="<unk>"` 兜底，避免 `unk_token=None` 且字符既非词汇又无 `<0xXX>` 时被静默丢弃。
+## 2. 行为
 
-脚本断言：`save()` 后读回 JSON 中 `"normalizer" is None`、`"post_processor" is None`、`model["byte_fallback"] is True`；且对训练语料做 `encode→decode` 还原无损。
+- 语言分离：`Hello你好→[Hello,你好]`；`abc123你好456→[abc,123,你好,456]`。
+- 数字：`3.14→[3.14]`，不拆成 `[3,.,14]`；长数字串内部保持连续。
+- 空白与尾 gap：`a  b→[a,  b]`；`hi `（末尾有空格）→`[hi ]`。`merged_with_next` 将间隔 gap 并入相邻片段，尾 gap 不会单独成片，原文不丢失。
+- JUNK 拖尾：`U.S.`、`a.b` 保持拖尾并可续接同类；`1️⃣` 也可整体保留。
+- 非显式脚本：泰老、阿拉伯、亚美尼亚、格鲁吉亚等不在三类显式分支中，按 gap 处理，可能并入相邻 match（`aกb→[aก,b]`），不保证独立切分。
 
----
+## 3. JUNK 拖尾决策
 
-## 7. 测试策略（内联，不建新文件）
+数据来自 `dataset/pretok_cmp/results_cmp_junktrail.json` 与 `results_cmp_junktrail_effic.json`：
 
-全部内联进 `split.rs` 现有 `#[cfg(test)] mod tests`，不新增类型/模块/fixture：
+| 变体 | 预分词吞吐（1KB/100KB/1MB） | 片段/1k字符 | chars/token |
+|---|---:|---:|---:|
+| 保留拖尾（C2） | 15.25 / 10.14 / 8.78 | 133.0 | 3.1993 |
+| 去掉拖尾 | 15.38 / 10.03 / 7.44 | 157.7 | 3.1524 |
 
-1. `class_regex_basic`：语言分离 + 数字连续 + 空格贴后（§3 用例矩阵）。
-2. `class_regex_lossless`：splits 拼接 == 输入、offsets 连续单调、无空 split（空串/纯空白/多语言/emoji-ZWJ/组合符）。
-3. `class_regex_junk_excludes_n`：断言 `abc123def` 不被 JUNK 塌缩、`3.14` 按字面拆。
-4. `class_regex_no_latin_fallback`：断言汉字不进 Latin run。
+**决策：保留 JUNK 拖尾组。** 压缩率约提升 1.5%，吞吐基本不变；去掉拖尾会增加碎片。两方案词表差异主要是标点附着方式。
 
----
+## 4. 序列化与目标管线
 
-## 8. 已知偏差（已声明，未修复）
+| 组件 | 取值 |
+|---|---|
+| `normalizer` / `post_processor` | `None` |
+| `pre_tokenizer` | `Split(CLASS_REGEX, merged_with_next, invert=false)` |
+| `model` | `BPE(byte_fallback=True, unk_token="<unk>")` |
+| `decoder` | `Sequence([ByteFallback(), Fuse()])` |
 
-- **脚本白名单未闭合**：`[\p{Latin}]+` 之后跟 `[^\p{White_Space}\p{L}\p{N}]*`，可能把未知脚本的拖尾字符一并吸入当前 run（例如中日韩之外的罕见脚本）。
-- **`U.S.A.` / `left.Now` 与 `3.14` 同形歧义**：无句间缩写规则，句点后是否断句存在歧义，与数字小数点无法区分（无句界层后此项归为「不建模」，由 Model 在子词层吸收）。
+原文直通，模板交给调用方。`byte_fallback` 是推理期能力：训练器不会自动注入完整字节词表；需训练后注入 `<0x00>..<0xFF>`、设置 `model.byte_fallback=true`，再读回校验。保存后应检查关键字段，并验证训练语料 `encode→decode` 无损。
 
----
+## 5. 限制与验证入口
 
-## 9. 过程经验总结（Lessons Learned）
+限制：脚本白名单未闭合，未知脚本可能被 Latin run 吸入；`U.S.A.`、`left.Now` 与小数点存在同形歧义，无句界层时不建模，由 Model 处理。升级 `tokenizers`、Unicode 数据或正则引擎后需重跑行为门禁。
 
-1. **序列化约束决定方案形态**：任何需 `from_file` 还原的预分词都必须落入可序列化节点；本方案即 plain `Split`，无此负担。
-2. **离线阻断 `make check-style` 的 stub-gen**：`tools/stub-gen` 需联网拉 crates，离线时只能手改 `.pyi`，合并前务必本地跑 `make check-style` 覆盖。
-3. **onig 的 `\p{}` 属性需逐个鉴别**：编译通过 ≠ 语义正确；本方案的属性名在 vendored oniguruma 中实测存在，但换引擎（fancy-regex/wasm）需重验。
-4. **`byte_fallback` 训练期无效**：这是 0.23.x 的发布轮坑，训练侧覆盖率只能靠 `initial_alphabet`，示例脚本据此设计。
-5. **`MergedWithNext` 合并方向影响断言**：它把每个 match 与其**后置** gap 合并（match + 紧跟其后的分隔符/空白），**前置** gap 成为独立 piece；例如 `Hello, world!` → `['Hello,', ' world!']`、`'U.S.'→['U.S.']`（含拖尾组）vs `['U.', 'S.']`（无拖尾组）。测试若直接比对 span 会误判，应改为「无损 + 去空白后核心 token 顺序」或「句界包含性」断言。
-6. **内存安全**：BPE 训练必须**流式** `train_from_iterator(逐行)`，整份语料常驻 + trainer 词频表曾触发 OOM 并清空 `/tmp` 工作区；每配置**独立进程**训练/测量，退出即释放内存（单程峰值 ~2.5GB）。
-7. **工作区持久化**：脚本/词表落在仓库 `dataset/pretok_cmp/`，并 `sys.path.insert(0, bindings/python/py_src)` 直接导入 `tokenizers`，不依赖 `.venv`。
+可执行入口：
 
----
+- `design/minimal-tokenizer-path.md`：`tokenizers==0.23.2` 的独立 PyPI 脚本；替换语料路径后运行，检查保存、读回、256 个 byte token 和无损往返。预分词行为以本文无前导换行的正则定义为准。
+- `dataset/pretok_cmp/cmp_junktrail.py`：`effic` / `report` 对照；直接加载固定路径的 `tokenizers.abi3.so`，依赖旧编译 binding，需先校准路径。
+- 在 `tokenizers/` 运行 `cargo test -p tk-encode split`：当前 Rust 通用 `Split` 回归；当前源码没有 `CLASS_REGEX` 专用单测。
 
-## 10. 句界扩展 sentence_breaks（已实现，未纳入最终配置）
-
-`sentence_breaks` 在 `Split` 上挂可选布尔字段：开启后先按 UAX #29 句界切片，再在每句内独立跑 `CLASS_REGEX + behavior`（句界切点由 `slice` 构造，零字符增删改、不跨界、可序列化）。改动面 `tokenizers/src/pre_tokenizers/split.rs` + `bindings/python/src/pre_tokenizers.rs` + `.pyi`；Rust 13 passed、Python 5 passed。
-
-**评测结论（见 `pretok-performance.md` 横向对比）**：
-
-- **压缩中性**：270MB 真实语料上 C1(带句界) vs C2(无句界) chars/token 仅差 ~0.2%（采样 2.620 vs 2.615；官方横评 3.206 vs 3.199）；词表改变约 3.4%（~1027 项），但压缩贡献极小。
-- **吞吐负收益**：句界引入 UAX #29 扫描 + 句内二次 `Split`，release 构建下 C1 较 C2 在 1KB 档慢约 4%（debug 构建下相对开销被放大到约 15%）。
-- **决策**：最终配置 `sentence_breaks=False`。该字段保留为可选能力（向后兼容、默认关闭），供需要句界隔离的场景（如跨句不可合并约束）按需开启。
-
----
-
-## 11. 验证结果
-
-| 验证项 | 命令 | 结果 |
-|---|---|---|
-| Rust 单元 | `cd tokenizers && cargo test --lib split` | **13 passed**（含 5 个 sentence_breaks 用例） |
-| 风格/静态 | `cargo fmt --check` + `cargo clippy --lib -D warnings` | 通过 |
-| Python 单元 | `pytest tests/bindings/test_pre_tokenizers.py -k Split` | **5 passed** |
-| 示例脚本 | `python bindings/python/examples/train_uax29_bpe.py` | 落盘 `normalizer=null`/`post_processor=null`/`model.byte_fallback=true`，7 句语料 encode→decode 无损 |
-| 横评 | `dataset/pretok_cmp/bench_hf_official.py` | C2 吞吐 11.11/6.48/4.71、chars/token 3.199（见 `pretok-performance.md`） |
-
----
-
-## 12. 后续维护提示
-
-- 升级 `tokenizers` / 换正则引擎时，重跑 §7 的内联测试门禁。
-- 若确需句界隔离，开启 `sentence_breaks=True`（§10），并补测跨句不可合并约束。
-- 性能基准参考 `pretok-performance.md`；本方案 `encode = 预分词 + 模型`，绝大多数成本在预分词阶段（C2 约 11/6.5/4.7 MiB/s，release 构建）。
+行为门禁至少覆盖：`Hello你好`、`abc123你好456`、`3.14`、`U.S.`、`a.b`、`a  b`、`hi `、`aกb`、保存读回及 `encode→decode` 无损。
