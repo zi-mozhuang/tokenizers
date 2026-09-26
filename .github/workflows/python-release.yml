@@ -1,11 +1,14 @@
 name: Python Release
+# FORK (zi-mozhuang/tokenizers): tag 触发已停用。本 fork 不发布到 PyPI
+# （没有 PyPI trusted publisher，推 tag 只会得到一次失败运行 + 一封邮件）。
+# 手动触发仍会编 sdist/wheel 并测试，但 `if` 会跳过上传。
 on:
-  push:
-    tags:
-      - v*
-      # ^ trigger when a v* tag gets pushed
-  # Manual runs build and test everything but never publish: see the `if` on `publish`.
   workflow_dispatch:
+  # push:
+  #   tags:
+  #     - v*
+  #     # ^ trigger when a v* tag gets pushed
+  # Manual runs build and test everything but never publish: see the `if` on `publish`.
 
 permissions: {}
 

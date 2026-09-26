@@ -5,11 +5,14 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '12.0'
 
 
+# FORK (zi-mozhuang/tokenizers): tag 触发已停用。本 fork 不发布到 npm
+# （没有 npm Trusted Publishing，推 tag 只会得到一次失败运行 + 一封邮件）。
+# 手动触发仍会编各 target，但 `if` 会跳过上传。
 on:
-  push:
-    tags:
-      - v*
   workflow_dispatch:
+  # push:
+  #   tags:
+  #     - v*
 
 permissions: {}
 

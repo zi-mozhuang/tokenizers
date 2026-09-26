@@ -1,7 +1,10 @@
 name: 'Close stale issues and PRs'
+# FORK (zi-mozhuang/tokenizers): 定时触发已停用。本 fork 不做 issue/PR  triage，
+# 每天跑一次除了刷 Actions 运行记录没有任何意义。需要时手动触发。
 on:
-  schedule:
-    - cron: '30 1 * * *'
+  workflow_dispatch:
+  # schedule:
+  #   - cron: '30 1 * * *'
 
 permissions: {}
 

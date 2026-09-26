@@ -1,10 +1,13 @@
 name: Upload PR Documentation
 
+# FORK (zi-mozhuang/tokenizers): 自动触发已停用。上游靠 workflow_run 跟着
+# "Build PR Documentation" 跑；本 fork 没有 HF_DOC_BUILD_PUSH / COMMENT_BOT_TOKEN secret。
 on:
-  workflow_run:
-    workflows: ["Build PR Documentation"]
-    types:
-      - completed
+  workflow_dispatch:
+  # workflow_run:
+  #   workflows: ["Build PR Documentation"]
+  #   types:
+  #     - completed
 
 jobs:
   build:

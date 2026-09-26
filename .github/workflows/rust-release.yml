@@ -1,12 +1,15 @@
 name: Rust Release
 
+# FORK (zi-mozhuang/tokenizers): tag 触发已停用。本 fork 不发布到 crates.io
+# （没有 crates.io Trusted Publishing 配置，推 tag 只会得到一次失败运行 + 一封邮件）。
+# 手动触发仍会跑完整流程，且 `if` 会跳过上传。
 on:
-  push:
-    tags:
-      - v*
+  workflow_dispatch:
+  # push:
+  #   tags:
+  #     - v*
   # Manual runs do everything but upload: the drift check, then `cargo publish --dry-run`, which
   # packages every crate and builds each one from its own tarball. See the publish step.
-  workflow_dispatch:
 
 permissions: {}
 

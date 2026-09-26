@@ -1,13 +1,16 @@
 name: Build PR Documentation
 
+# FORK (zi-mozhuang/tokenizers): 自动触发已停用。fork 没有 HF_DOC_BUILD_PUSH / COMMENT_BOT_TOKEN
+# secret，doc-builder 的 upload 步骤必然失败；本 fork 也不向 HF 同步文档。只保留手动触发。
 on:
-  pull_request:
-    # The bindings do not build against the v1 integration branch yet: `PipelineTokenizer` is
-    # read-only and the trainers left the umbrella crate, so a PR into `feat/train_encode_split`
-    # fails here for the reasons REQUIRED_FOR_V1.md §2 already tracks -- 195 references to wrapper
-    # types that no longer exist. Drop this filter together with the mutable pipeline builder.
-    branches-ignore:
-      - feat/train_encode_split
+  workflow_dispatch:
+  # pull_request:
+  #   # The bindings do not build against the v1 integration branch yet: `PipelineTokenizer` is
+  #   # read-only and the trainers left the umbrella crate, so a PR into `feat/train_encode_split`
+  #   # fails here for the reasons REQUIRED_FOR_V1.md §2 already tracks -- 195 references to wrapper
+  #   # types that no longer exist. Drop this filter together with the mutable pipeline builder.
+  #   branches-ignore:
+  #     - feat/train_encode_split
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}

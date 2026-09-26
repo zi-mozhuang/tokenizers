@@ -1,22 +1,24 @@
 name: Build documentation
 
+# FORK (zi-mozhuang/tokenizers): 自动触发已停用。fork 没有 HF_DOC_BUILD_PUSH secret，
+# doc-builder 的 "Sync to bucket" 步骤必然失败；本 fork 也不向 HF 空间同步文档。只保留手动触发。
 on:
-  push:
-    branches:
-      - main
-      - doc-builder*
-      - v*-release
-      - use_templates
-    tags:
-      - v*
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       ref:
         description: "Branch or tag to build (defaults to the workflow commit)"
         required: false
         default: ""
+  # push:
+  #   branches:
+  #     - main
+  #     - doc-builder*
+  #     - v*-release
+  #     - use_templates
+  #   tags:
+  #     - v*
+  # release:
+  #   types: [published]
 
 jobs:
   build:
