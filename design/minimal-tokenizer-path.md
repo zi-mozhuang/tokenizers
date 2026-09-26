@@ -4,18 +4,32 @@
 
 ## 1. 最终管线与基础词表规范
 
-基础词表分四层，职责不可混用；BPE 最终词表仍由语料和 merges 学习：
+基础词表分四层，职责不可混用；BPE 最终词表仍由语料和 merges 学习。**基础词表是 design-only 清单：包含方案需要的全部设计 token，但不包含任何训练语料字符。**
 
 | 层 | 内容 | 注入方式 | 约束 |
 |---|---|---|---|
-| `SPECIALS` | 通用边界、Qwen ChatML/视觉、DeepSeek BOS/EOS/视觉 token | `add_special_tokens()` + `BpeTrainer.special_tokens` | `special=True, normalized=False`；`<unk>` 固定为 ID 0 |
-| `PROTOCOL_TOKENS` | Qwen/DeepSeek 工具调用、工具结果、角色、FIM、思考标记 | 训练后 `add_tokens()` | `special=False, normalized=False`；仍按原文原子匹配，但不会被 `skip_special_tokens=True` 删除 |
-| `initial_alphabet` | 基础字符、语料字符、已有词表拆出的单字符 | `BpeTrainer.initial_alphabet` | 每项必须是单个 Unicode scalar |
+| `SPECIALS` | 通用边界、Qwen ChatML/视觉 token | `add_special_tokens()` + `BpeTrainer.special_tokens` | `special=True, normalized=False`；`<unk>` 固定为 ID 0 |
+| `PROTOCOL_TOKENS` | Qwen 工具调用、工具结果、FIM、repo、思考标记 | 训练后 `add_tokens()` | `special=False, normalized=False`；仍按原文原子匹配，但不会被 `skip_special_tokens=True` 删除 |
+| `initial_alphabet` | 设计规定的固定字符范围 | `BpeTrainer.initial_alphabet` | 不读取语料或缓存 alphabet；每项必须是单个 Unicode scalar |
 | `BYTE_TOKENS` | `<0x00>..<0xFF>` | 训练后写入 `model.vocab` | 不是 `AddedToken` 或 alphabet 项 |
 
-`AddedToken` 的 `special` 标志不是“是否原子匹配”的开关。Qwen3.8 与 DeepSeek-V4.1 的协议 token 实际位于 `added_tokens` 且 `special=false`；本方案保持此语义：协议 token 原子化，但解码时保留协议文本。为统一 identity 管线，本方案把协议 token 都设为 `normalized=False`；这不保证复刻 DeepSeek 官方 `normalized=True` 行为或 ID。
+`initial_alphabet` 只由本方案规定的固定 Unicode 范围组成（当前为 785 项）。训练语料只进入 `train_from_iterator()`，不进入初始词表；`dataset/pretok_cmp/alphabet.json` 也不作为初始词表输入。
 
-协议 profile：默认 `qwen`；只需 DeepSeek 时用 `deepseek`；确需双协议时才用 `both`。`both` 只是两套集合的并集，不代表兼容任一厂商的原始 ID；要求逐 ID 对齐时直接加载官方 `tokenizer.json`。
+`AddedToken` 的 `special` 标志不是“是否原子匹配”的开关。Qwen3.8 的协议 token 位于 `added_tokens` 且 `special=false`；本方案保持此语义：协议 token 原子化，但解码时保留协议文本。为统一 identity 管线，协议 token 设为 `normalized=False`；这不复刻官方 `normalized=True` 行为或 ID（审计差异见 §8）。
+
+### 1.1 初始词表范围与风格
+
+初始词表包含四层全部设计内容：`SPECIALS`、`PROTOCOL_TOKENS`、固定 `initial_alphabet`、`BYTE_TOKENS`。当前 Qwen 设计共 1,078 个设计项（25 + 12 + 785 + 256），但这不是训练后的 model vocab；训练前没有最终 ID 或 merges。扁平 `initial_vocab_tokens.json` 仅是设计清单，不能整体直接传给 `BpeTrainer`。
+
+风格标识为 `qwen-compat-v1`：
+
+- 新设计 token 使用 `<|namespace_token|>`，推荐正则：`^<\\|[a-z][a-z0-9_]*(?:[./][a-z][a-z0-9_]*)*\\|>$`。
+- 现有 Qwen 官方 token 保留原文；`<unk>`、`<pad>`、`<s>`、`</s>`、`<tts_*>`、`<tool_response>`、`<think>` 等是兼容例外，不强行改名。
+- 结构化 token 只用 ASCII；禁止 CR/LF/Tab、U+200B、`▁` 和全角竖线。byte token 固定为 `<0xHH>`，不是 `AddedToken`。
+- `special` 标志与字符串格式无关：模型边界/多模态 token 为 `special=True`；工具、FIM、思考协议为 `special=False`；全部使用 `normalized=False`、`lstrip=False`、`rstrip=False`、`single_word=False`。
+- 生成器记录 `style_profile` 和兼容例外；使用缓存时再记录官方来源文件 hash，并执行唯一性、分层不重叠、协议配对、byte token 完整性门禁。
+
+词表只有一套 Qwen 设计，同时服务 L0 与 L1：L1（`qwen_plus_v1`）零新协议 token（namespace 复用 `::` 文本，reminder/response_format 为普通文本位置约定），Qwen 词表直装。要求逐 ID 对齐官方时直接加载官方 `tokenizer.json`。DeepSeek token 仅作缓存审计用（§8），不进入训练脚本。
 
 其余管线固定为：
 
@@ -61,8 +75,6 @@ CLASS_REGEX = (
     r")"
 )
 
-TOKEN_PROFILE = "qwen"  # 最小路径默认 Qwen；双协议部署改为 "both"
-
 GENERIC_SPECIALS = ["<unk>", "<pad>", "<s>", "</s>"]
 
 # Qwen3.8-27B：special=true 的真实 ChatML/多模态 token。
@@ -75,66 +87,30 @@ QWEN_SPECIALS = [
     "<tts_text_bos_single>", "<|audio_pad|>",
 ]
 
-# DeepSeek-V4.1 严格 profile：tokenizer.json 中的 special=true token。
-# 不混入 V4 Pro 专有的 <｜image｜>；需要 V4 Pro 时另建 profile。
-DEEPSEEK_SPECIALS = [
-    "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜▁pad▁｜>",
-    "<｜end_of_query｜>", "<｜rl_image_pad｜>", "<｜rl_image_start｜>",
-    "<｜/polygon｜>", "<｜polygon｜>", "<｜/point｜>", "<｜point｜>",
-    "<｜/box｜>", "<｜box｜>", "<｜/ref｜>", "<｜ref｜>",
-]
-
 # Qwen 工具/协议 token：Qwen3.8 tokenizer.json 中 special=false。
+# 当前缓存快照的 tool-call content 是 ASCII；不要手工插入 U+200B，
+# 兼容其他快照时必须从官方 added_tokens[].content 逐字复制。
 QWEN_PROTOCOL_TOKENS = [
-    "<\u200btool_call>", "</\u200btool_call>", "<tool_response>", "</tool_response>",
+    "<" + "tool_call>", "</" + "tool_call>", "<tool_response>", "</tool_response>",
     "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>",
     "<|repo_name|>", "<|file_sep|>", "<think>", "</think>",
 ]
 
-# DeepSeek-V4.1 chat encoder 活跃 token：均为 tokenizer.json special=false。
-DEEPSEEK_V4_1_CHAT_TOKENS = [
-    "<｜System｜>", "<｜User｜>", "<｜Assistant｜>", "<｜latest_reminder｜>",
-    "｜DSML｜", "<｜deepseek_image｜>",
-    "<｜action｜>", "<｜query｜>", "<｜authority｜>", "<｜domain｜>",
-    "<｜title｜>", "<｜read_url｜>", "<think>", "</think>",
-]
-
-# 兼容、FIM 与 repo/file 扩展。旧 V4 tool control 仍存在，但不是 V4.1 DSML
-# encoder 的必需控制流；按需保留，不能拿来替换 ｜DSML｜。
-DEEPSEEK_COMPAT_PROTOCOL_TOKENS = [
-    "<|EOT|>", "<dsml:", "</dsml:",
-    "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>",
-    "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>",
-    "<｜tool▁outputs▁begin｜>", "<｜tool▁outputs▁end｜>",
-    "<｜tool▁output▁begin｜>", "<｜tool▁output▁end｜>", "<｜tool▁sep｜>",
-    "<｜fim▁hole｜>", "<｜fim▁begin｜>", "<｜fim▁end｜>",
-    "<｜begin▁of▁repo▁name｜>", "<｜end▁of▁repo▁name｜>",
-    "<｜begin▁of▁file▁name｜>", "<｜end▁of▁file▁name｜>",
-    "<｜begin▁of▁file｜>", "<｜end▁of▁file｜>",
-]
-DEEPSEEK_PROTOCOL_TOKENS = [
-    *DEEPSEEK_V4_1_CHAT_TOKENS,
-    *DEEPSEEK_COMPAT_PROTOCOL_TOKENS,
-]
-
-if TOKEN_PROFILE == "qwen":
-    SPECIALS = [*GENERIC_SPECIALS, *QWEN_SPECIALS]
-    PROTOCOL_TOKENS = QWEN_PROTOCOL_TOKENS
-elif TOKEN_PROFILE == "deepseek":  # 严格 DeepSeek-V4.1
-    SPECIALS = [*GENERIC_SPECIALS, *DEEPSEEK_SPECIALS]
-    PROTOCOL_TOKENS = DEEPSEEK_PROTOCOL_TOKENS
-elif TOKEN_PROFILE == "both":  # 仅词表并集；chat renderer 仍须二选一
-    SPECIALS = [*GENERIC_SPECIALS, *QWEN_SPECIALS, *DEEPSEEK_SPECIALS]
-    PROTOCOL_TOKENS = [*QWEN_PROTOCOL_TOKENS, *DEEPSEEK_PROTOCOL_TOKENS]
-else:
-    raise ValueError(f"unknown TOKEN_PROFILE: {TOKEN_PROFILE}")
+# L1（qwen_plus_v1，见 chat-templates.md §5）零新协议 token：
+# namespace 复用 `::` 文本，reminder/response_format 为普通文本位置约定。
+# DeepSeek 审计清单见 §8，不进入训练。
+SPECIALS = [*GENERIC_SPECIALS, *QWEN_SPECIALS]
+PROTOCOL_TOKENS = QWEN_PROTOCOL_TOKENS
 
 SPECIALS = list(dict.fromkeys(SPECIALS))
 PROTOCOL_TOKENS = list(dict.fromkeys(PROTOCOL_TOKENS))
 BYTE_TOKENS = tuple(f"<0x{value:02X}>" for value in range(256))
 
+STYLE_PROFILE = "qwen-compat-v1"
+CANONICAL_TOKEN_RE = re.compile(r"^<\|[a-z][a-z0-9_]*(?:[./][a-z][a-z0-9_]*)*\|>$")
+PLAIN_ANGLE_RE = re.compile(r"^</?[A-Za-z][A-Za-z0-9_]*>$")
+
 CORPUS_PATH = Path("/path/to/your/corpus.txt")
-ALPHABET_PATH = Path("/path/to/your/alphabet.json")  # 可选；仓库样本见 dataset/pretok_cmp/alphabet.json
 
 
 def iter_corpus(path):
@@ -142,17 +118,14 @@ def iter_corpus(path):
         yield from f
 
 
-def build_initial_alphabet(corpus_path, alphabet_path=None):
+def build_initial_alphabet():
+    # 只取设计规定的固定范围；不从训练语料或 alphabet.json 合并字符。
     chars = {chr(cp) for cp in range(0x20, 0x7F)} | set("\n\r\t")
     for start, end in (
         (0x00A0, 0x0100), (0x0300, 0x0370), (0x2000, 0x2070),
         (0x3000, 0x3100), (0xFE00, 0xFE10), (0xFF01, 0xFF60),
     ):
         chars.update(chr(cp) for cp in range(start, end))
-    if alphabet_path and alphabet_path.exists():
-        chars.update(json.loads(alphabet_path.read_text(encoding="utf-8")))
-    for line in iter_corpus(corpus_path):
-        chars.update(line)
     return sorted(
         ch for ch in chars
         if len(ch) == 1
@@ -162,11 +135,81 @@ def build_initial_alphabet(corpus_path, alphabet_path=None):
     )
 
 
-initial_alphabet = build_initial_alphabet(CORPUS_PATH, ALPHABET_PATH)
+initial_alphabet = build_initial_alphabet()
+assert len(initial_alphabet) == 785
 assert all(len(ch) == 1 for ch in initial_alphabet)
 assert len(SPECIALS) == len(set(SPECIALS))
 assert len(PROTOCOL_TOKENS) == len(set(PROTOCOL_TOKENS))
 assert not set(SPECIALS).intersection(PROTOCOL_TOKENS)
+
+# 结构化 token 的风格门禁；兼容例外只记录，不改写官方字符串。
+for token in (*SPECIALS, *PROTOCOL_TOKENS):
+    assert token and token.isascii()
+    assert token == token.strip()
+    assert not any(ch in token for ch in "\r\n\t\u200b\u2581\uff5c")
+    if token.startswith("<|"):
+        assert CANONICAL_TOKEN_RE.fullmatch(token)
+    else:
+        assert PLAIN_ANGLE_RE.fullmatch(token)
+assert len(BYTE_TOKENS) == 256
+assert all(re.fullmatch(r"<0x[0-9A-F]{2}>", token) for token in BYTE_TOKENS)
+
+# 训练前不存在的 vocab/ID/merges 不写入初始词表；
+# 四层设计清单可在训练前单独保存。
+design_tokens = [*SPECIALS, *PROTOCOL_TOKENS, *initial_alphabet, *BYTE_TOKENS]
+assert len(design_tokens) == len(set(design_tokens))
+structured_tokens = [*SPECIALS, *PROTOCOL_TOKENS]
+compatibility_exceptions = [
+    token for token in structured_tokens if not CANONICAL_TOKEN_RE.fullmatch(token)
+]
+
+initial_vocab = {
+    "phase": "design-only",
+    "trained": False,
+    "contains_training_corpus": False,
+    "style_profile": STYLE_PROFILE,
+    "canonical_new_token_pattern": CANONICAL_TOKEN_RE.pattern,
+    "compatibility_exceptions": compatibility_exceptions,
+    "layers": {
+        "specials": SPECIALS,
+        "protocol_tokens": PROTOCOL_TOKENS,
+        "initial_alphabet": initial_alphabet,
+        "byte_tokens": list(BYTE_TOKENS),
+    },
+    "injection": {
+        "before_training": ["specials", "initial_alphabet"],
+        "after_training": ["protocol_tokens", "byte_tokens"],
+    },
+    "trainer": {
+        "vocab_size": 30000,
+        "min_frequency": 2,
+        "special_tokens": SPECIALS,
+        "initial_alphabet": initial_alphabet,
+    },
+    "counts": {
+        "specials": len(SPECIALS),
+        "protocol_tokens": len(PROTOCOL_TOKENS),
+        "initial_alphabet": len(initial_alphabet),
+        "byte_tokens": len(BYTE_TOKENS),
+        "design_tokens_total": len(design_tokens),
+    },
+}
+Path("initial_vocab.json").write_text(
+    json.dumps(initial_vocab, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+Path("initial_vocab_tokens.json").write_text(
+    json.dumps(design_tokens, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+Path("post_training_tokens.json").write_text(
+    json.dumps(
+        {"protocol_tokens": PROTOCOL_TOKENS, "byte_tokens": list(BYTE_TOKENS)},
+        ensure_ascii=False,
+        indent=2,
+    ) + "\n",
+    encoding="utf-8",
+)
 
 # special token 在训练前注册；协议 token 训练后用 add_tokens 注册，保持 special=false。
 tok = Tokenizer(BPE(byte_fallback=True, unk_token="<unk>"))
@@ -188,7 +231,7 @@ trainer = BpeTrainer(
 )
 tok.train_from_iterator(iter_corpus(CORPUS_PATH), trainer)
 
-# Qwen/DeepSeek 的工具 token 实际是 special=false；不能用 add_special_tokens()。
+# Qwen 的工具 token 实际是 special=false；不能用 add_special_tokens()。
 for token in PROTOCOL_TOKENS:
     tok.add_tokens([AddedToken(
         token, special=False, normalized=False, single_word=False,
@@ -247,8 +290,14 @@ sample = "Hello 你好，世界 123 abc"
 enc = reloaded.encode(sample, add_special_tokens=False)
 assert reloaded.decode(enc.ids, skip_special_tokens=False) == sample
 assert enc.offsets[0][0] == 0 and enc.offsets[-1][1] == len(sample)
-assert all(left[1] == right[0] for left, right in zip(enc.offsets, enc.offsets[1:]))
-assert "".join(sample[start:end] for start, end in enc.offsets) == sample
+# byte_fallback 的多个 byte token 可以共享同一源字符 span；
+# 只要求单调覆盖完整，不要求 offsets 首尾严格相接。
+cursor = 0
+for start, end in enc.offsets:
+    assert 0 <= start < end <= len(sample)
+    assert start <= cursor <= end
+    cursor = max(cursor, end)
+assert cursor == len(sample)
 
 split_cases = {
     "Hello你好": ["Hello", "你好"],
@@ -260,48 +309,28 @@ split_cases = {
 for text, expected in split_cases.items():
     assert [part for part, _ in reloaded.pre_tokenizer.pre_tokenize_str(text)] == expected
 
-# Qwen/DeepSeek 协议 token 必须原子匹配，且 skip_special_tokens=True 仍保留。
-if TOKEN_PROFILE in ("qwen", "both"):
-    qwen_tool_sample = (
-        f"{QWEN_PROTOCOL_TOKENS[0]}get_weather{QWEN_PROTOCOL_TOKENS[1]}"
-        f"{QWEN_PROTOCOL_TOKENS[2]}ok{QWEN_PROTOCOL_TOKENS[3]}"
-    )
-    qwen_enc = reloaded.encode(qwen_tool_sample, add_special_tokens=False)
-    assert all(
-        reloaded.token_to_id(token) in qwen_enc.ids
-        for token in QWEN_PROTOCOL_TOKENS[:4]
-    )
-    assert reloaded.decode(qwen_enc.ids, skip_special_tokens=True) == qwen_tool_sample
-
-if TOKEN_PROFILE in ("deepseek", "both"):
-    # V4.1 使用 DSML；旧 <｜tool▁call▁begin｜> token 不是必需控制流。
-    deepseek_tool_sample = (
-        "<｜System｜>tools"
-        "<｜Assistant｜><｜DSML｜ calls>"
-        '<｜DSML｜ invoke name="get_weather">'
-        '<｜DSML｜ parameter name="city" string="true">北京</｜DSML｜ parameter>'
-        "</｜DSML｜ invoke>"
-        "</｜DSML｜ calls>"
-    )
-    deepseek_enc = reloaded.encode(deepseek_tool_sample, add_special_tokens=False)
-    assert all(
-        reloaded.token_to_id(token) in deepseek_enc.ids
-        for token in ("<｜System｜>", "<｜Assistant｜>", "｜DSML｜")
-    )
-    assert reloaded.decode(
-        deepseek_enc.ids, skip_special_tokens=True
-    ) == deepseek_tool_sample
+# Qwen 协议 token 必须原子匹配，且 skip_special_tokens=True 仍保留。
+qwen_tool_sample = (
+    f"{QWEN_PROTOCOL_TOKENS[0]}get_weather{QWEN_PROTOCOL_TOKENS[1]}"
+    f"{QWEN_PROTOCOL_TOKENS[2]}ok{QWEN_PROTOCOL_TOKENS[3]}"
+)
+qwen_enc = reloaded.encode(qwen_tool_sample, add_special_tokens=False)
+assert all(
+    reloaded.token_to_id(token) in qwen_enc.ids
+    for token in QWEN_PROTOCOL_TOKENS[:4]
+)
+assert reloaded.decode(qwen_enc.ids, skip_special_tokens=True) == qwen_tool_sample
 ```
 
-运行：`cd ~ && python min_tok.py`。脚本末尾检查当前 `Split` 字段、固定 special ID、256 byte token、协议 flags/原子性、offset 连续性与 decode 无损。
+运行：`cd ~ && python min_tok.py`。脚本先写出不含训练语料的 `initial_vocab.json`、`initial_vocab_tokens.json` 和 `post_training_tokens.json`，再流式训练；末尾检查当前 `Split` 字段、固定 special ID、256 byte token、协议 flags/原子性、单调 offset 覆盖与 decode 无损。
 
 ## 4. Chat Template 层
 
-完整设计、固定版本官方来源、集成代码、输入输出契约、响应解析与回归矩阵见 [`chat-templates.md`](chat-templates.md)。本节只固定 tokenizer 与 chat renderer 的边界：
+完整设计见 [`chat-templates.md`](chat-templates.md)（L0 官方基线 + L1 增强默认 `qwen_plus_v1`）。本节只固定 tokenizer 与 chat renderer 的边界：
 
-- `TOKEN_PROFILE` 只控制 `SPECIALS` / `PROTOCOL_TOKENS` 词表；`CHAT_PROFILE` 控制 renderer/parser，取值只能是 `qwen3_8` 或 `deepseek_v4_1`。
-- `TOKEN_PROFILE="both"` 只是词表并集，不代表存在兼容两家的混合 chat 协议；调用时仍须显式选择一个 `CHAT_PROFILE`。
-- Qwen3.8 使用固定 commit 的官方 `chat_template.jinja`，另需 `jinja2>=3.1,<4`；DeepSeek-V4.1 没有 Jinja，必须使用官方 `encoding/encoding.py`，不能凭记忆重写协议。
+- 本路径只产出 Qwen 词表（`SPECIALS`/`PROTOCOL_TOKENS`，`TOKEN_PROFILE` 已删除）；`CHAT_PROFILE` 取 `qwen3_8` 或 `qwen_plus_v1`（默认后者）。
+- L1 零新协议 token：namespace 复用 `::` 文本，reminder/response_format 为普通文本；Qwen 词表直装。
+- Qwen 使用固定 commit 的官方 `chat_template.jinja`，另需 `jinja2>=3.1,<4`；L1 增强层（normalize/parse）见 `chat-templates.md` §5。
 - renderer 已显式插入协议 special token，编码时必须关闭 tokenizer 的自动加词：
 
 ```python
@@ -313,12 +342,11 @@ encoding = tokenizer.encode(
 ```
 
 - 多模态 renderer 只生成占位符和有序 media records；图片/视频像素处理仍由 `AutoProcessor` 或模型专用 processor 完成。
-- DeepSeek 默认 profile 严格对应 V4.1；V4 Pro 的 `<｜image｜>` 不进入 V4.1 词表。需要 V4 Pro 时另建 `deepseek_v4_pro` profile。
 
 ## 5. 关键限制
 
-- 工具名称、JSON 参数、结果正文仍是普通文本；只固定协议边界。Qwen 的 `<tools>`/`<function=...>` 和 DeepSeek 的角色/DSML 扩展按缓存内容选择性加入，不要把全部业务 schema 固化为 special。
-- `merged_with_next` 把 match 与后置 gap 合并，例如 `Hello, world! -> ['Hello,', ' world!']`；训练用 `train_from_iterator` 逐行读取，字符种子可从 `alphabet.json` 读取，避免整份语料常驻。
+- 工具名称、JSON 参数、结果正文仍是普通文本；只固定协议边界。Qwen 的 `<tools>`/`<function=...>`（namespace 复用 `::` 文本）按缓存内容选择性加入，不要把全部业务 schema 固化为 special。
+- `merged_with_next` 把 match 与后置 gap 合并，例如 `Hello, world! -> ['Hello,', ' world!']`；训练用 `train_from_iterator` 逐行读取。初始词表只使用设计规定的固定字符范围，不从训练语料或 `alphabet.json` 合并字符。
 - `ByteLevel(trim_offsets=true)` / `RobertaProcessing` 可能改 offsets；`Bert/Template` 会加 CLS/SEP/BOS/EOS。原型先保持 `post_processor=None`。
 - DeepSeek `tokenizer_config.json` 的 `unk_token=null`、pad 字段可能与 `tokenizer.json` 不一致；复用以 `tokenizer.json` 的 `added_tokens`/model vocab 为准。本自训路径仍保留 `<unk>` 作为安全兜底。
 
@@ -339,11 +367,10 @@ encoding = tokenizer.encode(
 当前 `landsurvey/` 中景观覆盖集 10 个，加本节 3 个候选，共 13 个稳定软链。缓存只用于命名、协议和覆盖率审计：
 
 - Qwen3.8：`SPECIALS` 采用 ChatML、视觉、音频/TTS；tool、FIM、repo、think 走 `PROTOCOL_TOKENS`，且官方 `tokenizer.json` 标记为 `special=false`。
-- DeepSeek-V4.1 严格 profile：`SPECIALS` 采用 BOS/EOS/PAD、`end_of_query`、RL 图像/几何 token；DSML、角色、reminder、任务、图像占位符、FIM/repo 兼容项走 `PROTOCOL_TOKENS`，同样为 `special=false`。V4 Pro token 不混入。
-- DeepSeek 的大量 `｜place▁holder▁no▁N｜`、reserved/dummy token 不进入基础词表；厂商小版本特有 token 仅在对应缓存中确认后加入。
+- DeepSeek 只审计（§8 清单）：V4.1 严格项与 V4 Pro 专有 `<｜image｜>` 的区分、`｜place▁holder▁no▁N｜`/reserved/dummy 不入库、厂商小版本特有 token 需缓存确认，均只用于审计结论，不进入训练词表。
 - 字符参考只取字符级 BPE vocab 中 `len(token) == 1` 的项；三个候选都需处理 `▁`。
 - byte-level 的 `Ġ/Ċ` 等映射字符只作行为对照，不并入 `initial_alphabet`。
-- 工具标记必须从官方 `added_tokens[].content` 逐字复制。Qwen3.8 的 tool-call opening/closing content 确实含 U+200B；不要手工改成可见 ASCII，也不要凭肉眼重建。
+- 工具标记必须从官方 `added_tokens[].content` 逐字复制。当前 Qwen 缓存快照的 tool-call opening/closing 原始 content 不含 U+200B；不同官方 commit 可能不同，必须校验 code point/原始 bytes，不能凭肉眼重建。
 
 复用步骤：
 
@@ -366,8 +393,45 @@ HF_ENDPOINT=https://hf-mirror.com python -P download_charbpe_3.py
 
 HF BPE 不支持真正增量续训；`train_from_iterator` 每次重建 vocab 与 merges。扩展训练只能“旧词表拆字符 + 新语料 + 重新训练”：
 
-1. 以 `initial_alphabet` 为底，从旧 model vocab 逐项加入字符，排除 `SPECIALS`、`PROTOCOL_TOKENS`、旧 `added_tokens`、`<0x...>`；再加入新语料字符，删除 `▁`，最终只保留单个 Unicode scalar。
+1. 扩展训练另建 `extended_alphabet`：以设计固定 `initial_alphabet` 为底，从旧 model vocab 逐项加入字符，排除 `SPECIALS`、`PROTOCOL_TOKENS`、旧 `added_tokens`、`<0x...>`；如需覆盖新语料，再加入新语料字符，删除 `▁`，最终只保留单个 Unicode scalar。这个扩展输入不回写 design-only 初始词表。
 2. 复用 §3 全部管线与 `BpeTrainer(vocab_size=32000, special_tokens=SPECIALS, initial_alphabet=extended_alphabet)`；旧语料也并入 iterator，以保留旧多字符 token 的词频。
 3. 训练后用 `add_tokens()` 注册 `PROTOCOL_TOKENS`，再调用 `inject_byte_tokens()`，设置同一 decoder，保存并重跑 §3 门禁。`vocab_size` 需给新语料留余量。
 
-少量领域词/专名且必须保持旧 ID 时，改用 `tok.add_tokens(["新词1", "专用术语XYZ"])`；不重算 merges、压缩率略差。特殊 token 用 `add_special_tokens()`；Qwen/DeepSeek 工具/角色/FIM token 用 `add_tokens()` 并保持 `special=False`。
+少量领域词/专名且必须保持旧 ID 时，改用 `tok.add_tokens(["新词1", "专用术语XYZ"])`；不重算 merges、压缩率略差。特殊 token 用 `add_special_tokens()`；工具/角色/FIM/think 等协议 token 用 `add_tokens()` 并保持 `special=False`。
+
+## 8. DeepSeek 审计用 token 清单（非规范，不进训练）
+
+本节清单仅用于缓存审计与对照（§6），不进入 §3 训练脚本。L1（`qwen_plus_v1`）不需要其中任何 token。
+
+```python
+# DeepSeek-V4.1 严格项：tokenizer.json 中的 special=true token。
+# 不混入 V4 Pro 专有的 <｜image｜>；需要 V4 Pro 时另建审计项。
+DEEPSEEK_SPECIALS_AUDIT = [
+    "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜▁pad▁｜>",
+    "<｜end_of_query｜>", "<｜rl_image_pad｜>", "<｜rl_image_start｜>",
+    "<｜/polygon｜>", "<｜polygon｜>", "<｜/point｜>", "<｜point｜>",
+    "<｜/box｜>", "<｜box｜>", "<｜/ref｜>", "<｜ref｜>",
+]
+
+# DeepSeek-V4.1 chat encoder 活跃 token：均为 tokenizer.json special=false。
+DEEPSEEK_V4_1_CHAT_TOKENS_AUDIT = [
+    "<｜System｜>", "<｜User｜>", "<｜Assistant｜>", "<｜latest_reminder｜>",
+    "｜DSML｜", "<｜deepseek_image｜>",
+    "<｜action｜>", "<｜query｜>", "<｜authority｜>", "<｜domain｜>",
+    "<｜title｜>", "<｜read_url｜>", "<think>", "</think>",
+]
+
+# 兼容、FIM 与 repo/file 扩展。旧 V4 tool control 仍存在，但不是 V4.1 DSML
+# encoder 的必需控制流；按需保留，不能拿来替换 ｜DSML｜。
+DEEPSEEK_COMPAT_PROTOCOL_TOKENS_AUDIT = [
+    "<|EOT|>", "<dsml:", "</dsml:",
+    "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>",
+    "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>",
+    "<｜tool▁outputs▁begin｜>", "<｜tool▁outputs▁end｜>",
+    "<｜tool▁output▁begin｜>", "<｜tool▁output▁end｜>", "<｜tool▁sep｜>",
+    "<｜fim▁hole｜>", "<｜fim▁begin｜>", "<｜fim▁end｜>",
+    "<｜begin▁of▁repo▁name｜>", "<｜end▁of▁repo▁name｜>",
+    "<｜begin▁of▁file▁name｜>", "<｜end▁of▁file▁name｜>",
+    "<｜begin▁of▁file｜>", "<｜end▁of▁file｜>",
+]
+```
