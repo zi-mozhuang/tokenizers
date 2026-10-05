@@ -6,6 +6,11 @@
 - v1 rc0 架构：runtime 是 `tk_encode::pipeline::PipelineTokenizer`（只读），reader 是 `tk_serialize::{from_json, from_json_file}`（无 serde），升级是 `tk_convert::canonicalize_*`。umbrella `tokenizers/src/lib.rs` 只是重导出。缺失功能（setters、`save`、`from_pretrained`、trainers、truncation/padding 语义）见根目录 `REQUIRED_FOR_V1.md`，不要按旧版 `Tokenizer::new/add_tokens` 写法补代码。
 - `tk-encode` 与 `tk-serialize` 的组件 feature（`bpe,unigram,wordpiece,wordlevel,normalizers,unicode-scripts,parallelism`）必须对齐：reader 每个组件一个 match arm，一边缺了 load 时才炸，build 看不出。
 
+## 本 fork 本地约定（upstream 没有）
+- `design/` 是设计真相源：动 pre-tokenizer / post-processor / model / 训练路径前先读 `design/README.md`（阅读顺序与定案约束），先改文档再改实现。
+- 自训实验不走本地 Rust core：根目录 `min_tok.py`（产出 `tokenizer.json`）用 PyPI `tokenizers==0.23.2` 旧训练 API，跑在独立 venv（步骤见 `design/minimal-tokenizer-path.md`）。本地绑定的 trainers 明确未提供（`bindings/python/src/lib.rs` 有 `TODO: bind trainers`），不要用 `make develop` 的构建去跑它。
+- `dataset/`（语料）、`tmp/`、`graphify-out/` 均为 gitignored：实验草稿放 `tmp/`，不要提交产物或大文件。
+
 ## Rust core — 工作目录 `tokenizers/`
 - `make test [HF="uvx --from huggingface_hub hf"]`：下载 fixtures 到 `data/`（gitignored，pin 在 `HF_REVISION`）再 `cargo test --workspace --no-fail-fast`。无 `hf` CLI 时必须传后者，CI 同理。`make data` 只下载不跑。
 - 定向：`cargo test -p <crate> <filter>`；全量门禁 `make all-checks`（`lint test doc feature-matrix oracle`）。

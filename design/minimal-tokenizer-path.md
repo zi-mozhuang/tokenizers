@@ -8,14 +8,14 @@
 
 | 层 | 内容 | 注入方式 | 约束 |
 |---|---|---|---|
-| `SPECIALS` | 通用边界、Qwen ChatML/视觉、DeepSeek BOS/EOS/视觉 token | `add_special_tokens()` + `BpeTrainer.special_tokens` | `special=True, normalized=False`；`<unk>` 固定为 ID 0 |
-| `PROTOCOL_TOKENS` | Qwen/DeepSeek 工具调用、工具结果、角色、FIM、思考标记 | 训练后 `add_tokens()` | `special=False, normalized=False`；仍按原文原子匹配，但不会被 `skip_special_tokens=True` 删除 |
+| `SPECIALS` | 通用边界与预留槽位、Qwen ChatML/视觉、DeepSeek BOS/EOS/视觉 token | `add_special_tokens()` + `BpeTrainer.special_tokens` | `special=True, normalized=False`；`<unk>` 固定为 ID 0 |
+| `PROTOCOL_TOKENS` | 通用 think/tool_call/tool_response 与预留槽位，加 Qwen FIM/repo、DeepSeek 角色/DSML/FIM/repo | 训练后 `add_tokens()` | `special=False, normalized=False`；仍按原文原子匹配，但不会被 `skip_special_tokens=True` 删除 |
 | `initial_alphabet` | 基础字符、语料字符、已有词表拆出的单字符 | `BpeTrainer.initial_alphabet` | 每项必须是单个 Unicode scalar |
 | `BYTE_TOKENS` | `<0x00>..<0xFF>` | 训练后写入 `model.vocab` | 不是 `AddedToken` 或 alphabet 项 |
 
 `AddedToken` 的 `special` 标志不是“是否原子匹配”的开关。Qwen3.8 与 DeepSeek-V4.1 的协议 token 实际位于 `added_tokens` 且 `special=false`；本方案保持此语义：协议 token 原子化，但解码时保留协议文本。为统一 identity 管线，本方案把协议 token 都设为 `normalized=False`；这不保证复刻 DeepSeek 官方 `normalized=True` 行为或 ID。
 
-协议 profile：默认 `qwen`；只需 DeepSeek 时用 `deepseek`；确需双协议时才用 `both`。`both` 只是两套集合的并集，不代表兼容任一厂商的原始 ID；要求逐 ID 对齐时直接加载官方 `tokenizer.json`。
+协议 profile：默认`both`。`GENERIC_SPECIALS` / `GENERIC_PROTOCOL_TOKENS` 在三个 profile 下都注入，含 `<create>`、`</create>`、`<|extra_0..4|>`、`<|extra_5..9|>` 等预留槽位；厂商集合（`QWEN_SPECIALS` / `DEEPSEEK_SPECIALS` 及其协议 token）按 profile 追加。`both` 只是两套集合的并集，不代表兼容任一厂商的原始 ID；要求逐 ID 对齐时直接加载官方 `tokenizer.json`。
 
 其余管线固定为：
 
@@ -36,264 +36,42 @@ pip install "tokenizers==0.23.2"
 
 ## 3. 自训脚本
 
-保存为仓库外的 `~/min_tok.py`，替换语料路径后运行。脚本流式训练、注入完整 byte vocab、保存 tokenizer，并执行结构、ID、协议和无损门禁。
+脚本本体：[`min_tok.py`](../min_tok.py)。它流式训练、注入完整 byte vocab、保存 tokenizer，并执行结构、ID、协议和无损门禁。
 
-```python
-import json
-import re
-from pathlib import Path
+运行前确认下列常量：
 
-from tokenizers import AddedToken, Regex, Tokenizer
-from tokenizers.decoders import ByteFallback, Fuse, Sequence
-from tokenizers.models import BPE
-from tokenizers.pre_tokenizers import Split
-from tokenizers.trainers import BpeTrainer
+| 常量 | 作用 |
+|---|---|
+| `TOKEN_PROFILE` | `qwen` / `deepseek` / `both`（脚本当前为 `both`），只影响 `SPECIALS` / `PROTOCOL_TOKENS` |
+| `CORPUS_PATH` | 训练语料，逐行流式读取 |
+| `ALPHABET_PATH` | 可选的 `alphabet.json`（字符种子），仓库样本见 `dataset/pretok_cmp/alphabet.json` |
 
-CLASS_REGEX = (
-    r"\p{White_Space}*"
-    r"(?:"
-    r"[\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+"
-    r"(?:[^\p{White_Space}\p{L}\p{N}]*[\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+)*"
-    r"|[\p{Latin}]+"
-    r"(?:[^\p{White_Space}\p{L}\p{N}]*[\p{Latin}]+)*"
-    r"|\p{N}+"
-    r"(?:[^\p{White_Space}\p{L}]*\p{N}+)*"
-    r")"
-)
-
-TOKEN_PROFILE = "qwen"  # 最小路径默认 Qwen；双协议部署改为 "both"
-
-GENERIC_SPECIALS = ["<unk>", "<pad>", "<s>", "</s>"]
-
-# Qwen3.8-27B：special=true 的真实 ChatML/多模态 token。
-QWEN_SPECIALS = [
-    "<|endoftext|>", "<|im_start|>", "<|im_end|>",
-    "<|object_ref_start|>", "<|object_ref_end|>", "<|box_start|>", "<|box_end|>",
-    "<|quad_start|>", "<|quad_end|>", "<|vision_start|>", "<|vision_end|>",
-    "<|vision_pad|>", "<|image_pad|>", "<|video_pad|>", "<|audio_start|>",
-    "<|audio_end|>", "<tts_pad>", "<tts_text_bos>", "<tts_text_eod>",
-    "<tts_text_bos_single>", "<|audio_pad|>",
-]
-
-# DeepSeek-V4.1 严格 profile：tokenizer.json 中的 special=true token。
-# 不混入 V4 Pro 专有的 <｜image｜>；需要 V4 Pro 时另建 profile。
-DEEPSEEK_SPECIALS = [
-    "<｜begin▁of▁sentence｜>", "<｜end▁of▁sentence｜>", "<｜▁pad▁｜>",
-    "<｜end_of_query｜>", "<｜rl_image_pad｜>", "<｜rl_image_start｜>",
-    "<｜/polygon｜>", "<｜polygon｜>", "<｜/point｜>", "<｜point｜>",
-    "<｜/box｜>", "<｜box｜>", "<｜/ref｜>", "<｜ref｜>",
-]
-
-# Qwen 工具/协议 token：Qwen3.8 tokenizer.json 中 special=false。
-QWEN_PROTOCOL_TOKENS = [
-    "<\u200btool_call>", "</\u200btool_call>", "<tool_response>", "</tool_response>",
-    "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>", "<|fim_pad|>",
-    "<|repo_name|>", "<|file_sep|>", "<think>", "</think>",
-]
-
-# DeepSeek-V4.1 chat encoder 活跃 token：均为 tokenizer.json special=false。
-DEEPSEEK_V4_1_CHAT_TOKENS = [
-    "<｜System｜>", "<｜User｜>", "<｜Assistant｜>", "<｜latest_reminder｜>",
-    "｜DSML｜", "<｜deepseek_image｜>",
-    "<｜action｜>", "<｜query｜>", "<｜authority｜>", "<｜domain｜>",
-    "<｜title｜>", "<｜read_url｜>", "<think>", "</think>",
-]
-
-# 兼容、FIM 与 repo/file 扩展。旧 V4 tool control 仍存在，但不是 V4.1 DSML
-# encoder 的必需控制流；按需保留，不能拿来替换 ｜DSML｜。
-DEEPSEEK_COMPAT_PROTOCOL_TOKENS = [
-    "<|EOT|>", "<dsml:", "</dsml:",
-    "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>",
-    "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>",
-    "<｜tool▁outputs▁begin｜>", "<｜tool▁outputs▁end｜>",
-    "<｜tool▁output▁begin｜>", "<｜tool▁output▁end｜>", "<｜tool▁sep｜>",
-    "<｜fim▁hole｜>", "<｜fim▁begin｜>", "<｜fim▁end｜>",
-    "<｜begin▁of▁repo▁name｜>", "<｜end▁of▁repo▁name｜>",
-    "<｜begin▁of▁file▁name｜>", "<｜end▁of▁file▁name｜>",
-    "<｜begin▁of▁file｜>", "<｜end▁of▁file｜>",
-]
-DEEPSEEK_PROTOCOL_TOKENS = [
-    *DEEPSEEK_V4_1_CHAT_TOKENS,
-    *DEEPSEEK_COMPAT_PROTOCOL_TOKENS,
-]
-
-if TOKEN_PROFILE == "qwen":
-    SPECIALS = [*GENERIC_SPECIALS, *QWEN_SPECIALS]
-    PROTOCOL_TOKENS = QWEN_PROTOCOL_TOKENS
-elif TOKEN_PROFILE == "deepseek":  # 严格 DeepSeek-V4.1
-    SPECIALS = [*GENERIC_SPECIALS, *DEEPSEEK_SPECIALS]
-    PROTOCOL_TOKENS = DEEPSEEK_PROTOCOL_TOKENS
-elif TOKEN_PROFILE == "both":  # 仅词表并集；chat renderer 仍须二选一
-    SPECIALS = [*GENERIC_SPECIALS, *QWEN_SPECIALS, *DEEPSEEK_SPECIALS]
-    PROTOCOL_TOKENS = [*QWEN_PROTOCOL_TOKENS, *DEEPSEEK_PROTOCOL_TOKENS]
-else:
-    raise ValueError(f"unknown TOKEN_PROFILE: {TOKEN_PROFILE}")
-
-SPECIALS = list(dict.fromkeys(SPECIALS))
-PROTOCOL_TOKENS = list(dict.fromkeys(PROTOCOL_TOKENS))
-BYTE_TOKENS = tuple(f"<0x{value:02X}>" for value in range(256))
-
-CORPUS_PATH = Path("/path/to/your/corpus.txt")
-ALPHABET_PATH = Path("/path/to/your/alphabet.json")  # 可选；仓库样本见 dataset/pretok_cmp/alphabet.json
-
-
-def iter_corpus(path):
-    with path.open("r", encoding="utf-8", errors="replace") as f:
-        yield from f
-
-
-def build_initial_alphabet(corpus_path, alphabet_path=None):
-    chars = {chr(cp) for cp in range(0x20, 0x7F)} | set("\n\r\t")
-    for start, end in (
-        (0x00A0, 0x0100), (0x0300, 0x0370), (0x2000, 0x2070),
-        (0x3000, 0x3100), (0xFE00, 0xFE10), (0xFF01, 0xFF60),
-    ):
-        chars.update(chr(cp) for cp in range(start, end))
-    if alphabet_path and alphabet_path.exists():
-        chars.update(json.loads(alphabet_path.read_text(encoding="utf-8")))
-    for line in iter_corpus(corpus_path):
-        chars.update(line)
-    return sorted(
-        ch for ch in chars
-        if len(ch) == 1
-        and not 0xD800 <= ord(ch) <= 0xDFFF
-        and not 0xFDD0 <= ord(ch) <= 0xFDEF
-        and ord(ch) not in (0xFFFE, 0xFFFF)
-    )
-
-
-initial_alphabet = build_initial_alphabet(CORPUS_PATH, ALPHABET_PATH)
-assert all(len(ch) == 1 for ch in initial_alphabet)
-assert len(SPECIALS) == len(set(SPECIALS))
-assert len(PROTOCOL_TOKENS) == len(set(PROTOCOL_TOKENS))
-assert not set(SPECIALS).intersection(PROTOCOL_TOKENS)
-
-# special token 在训练前注册；协议 token 训练后用 add_tokens 注册，保持 special=false。
-tok = Tokenizer(BPE(byte_fallback=True, unk_token="<unk>"))
-tok.normalizer = None
-tok.pre_tokenizer = Split(Regex(CLASS_REGEX), behavior="merged_with_next")
-tok.post_processor = None
-for token in SPECIALS:
-    tok.add_special_tokens([AddedToken(
-        token, special=True, normalized=False, single_word=False,
-        lstrip=False, rstrip=False,
-    )])
-
-trainer = BpeTrainer(
-    vocab_size=30000,
-    min_frequency=2,
-    special_tokens=SPECIALS,
-    initial_alphabet=initial_alphabet,
-    show_progress=True,
-)
-tok.train_from_iterator(iter_corpus(CORPUS_PATH), trainer)
-
-# Qwen/DeepSeek 的工具 token 实际是 special=false；不能用 add_special_tokens()。
-for token in PROTOCOL_TOKENS:
-    tok.add_tokens([AddedToken(
-        token, special=False, normalized=False, single_word=False,
-        lstrip=False, rstrip=False,
-    )])
-
-
-# byte_fallback 不会自动生成字节词表；训练后补齐全部 256 项。
-def inject_byte_tokens(tokenizer):
-    data = json.loads(tokenizer.to_str())
-    model = data["model"]
-    next_id = max(model["vocab"].values(), default=-1) + 1
-    for token in BYTE_TOKENS:
-        if token not in model["vocab"]:
-            model["vocab"][token] = next_id
-            next_id += 1
-    model["byte_fallback"] = True
-    model["unk_token"] = "<unk>"
-    return Tokenizer.from_str(json.dumps(data, ensure_ascii=False))
-
-
-tok = inject_byte_tokens(tok)
-tok.decoder = Sequence([ByteFallback(), Fuse()])
-tok.save("tokenizer.json")
-
-reloaded = Tokenizer.from_file("tokenizer.json")
-data = json.loads(reloaded.to_str())
-assert data["normalizer"] is None
-assert data["post_processor"] is None
-assert data["model"]["byte_fallback"] is True
-pretok = data["pre_tokenizer"]
-assert pretok["type"] == "Split"
-assert pretok["behavior"] == "MergedWithNext"
-assert pretok["invert"] is False
-assert "sentence_breaks" not in pretok
-assert reloaded.token_to_id("<unk>") == 0
-special_ids = [reloaded.token_to_id(token) for token in SPECIALS]
-assert special_ids == list(range(len(SPECIALS)))
-for token in SPECIALS:
-    added = reloaded.get_added_tokens_decoder()[special_ids[SPECIALS.index(token)]]
-    assert added.special is True and added.normalized is False
-for token in PROTOCOL_TOKENS:
-    token_id = reloaded.token_to_id(token)
-    assert token_id is not None
-    added = reloaded.get_added_tokens_decoder()[token_id]
-    assert added.special is False and added.normalized is False
-    assert not added.lstrip and not added.rstrip
-
-byte_vocab = {
-    token for token in reloaded.get_vocab()
-    if re.fullmatch(r"<0x[0-9A-F]{2}>", token)
-}
-assert byte_vocab == set(BYTE_TOKENS)
-
-sample = "Hello 你好，世界 123 abc"
-enc = reloaded.encode(sample, add_special_tokens=False)
-assert reloaded.decode(enc.ids, skip_special_tokens=False) == sample
-assert enc.offsets[0][0] == 0 and enc.offsets[-1][1] == len(sample)
-assert all(left[1] == right[0] for left, right in zip(enc.offsets, enc.offsets[1:]))
-assert "".join(sample[start:end] for start, end in enc.offsets) == sample
-
-split_cases = {
-    "Hello你好": ["Hello", "你好"],
-    "abc123你好456": ["abc", "123", "你好", "456"],
-    "3.14": ["3.14"],
-    "U.S.": ["U.S."],
-    "a  b": ["a", "  b"],
-}
-for text, expected in split_cases.items():
-    assert [part for part, _ in reloaded.pre_tokenizer.pre_tokenize_str(text)] == expected
-
-# Qwen/DeepSeek 协议 token 必须原子匹配，且 skip_special_tokens=True 仍保留。
-if TOKEN_PROFILE in ("qwen", "both"):
-    qwen_tool_sample = (
-        f"{QWEN_PROTOCOL_TOKENS[0]}get_weather{QWEN_PROTOCOL_TOKENS[1]}"
-        f"{QWEN_PROTOCOL_TOKENS[2]}ok{QWEN_PROTOCOL_TOKENS[3]}"
-    )
-    qwen_enc = reloaded.encode(qwen_tool_sample, add_special_tokens=False)
-    assert all(
-        reloaded.token_to_id(token) in qwen_enc.ids
-        for token in QWEN_PROTOCOL_TOKENS[:4]
-    )
-    assert reloaded.decode(qwen_enc.ids, skip_special_tokens=True) == qwen_tool_sample
-
-if TOKEN_PROFILE in ("deepseek", "both"):
-    # V4.1 使用 DSML；旧 <｜tool▁call▁begin｜> token 不是必需控制流。
-    deepseek_tool_sample = (
-        "<｜System｜>tools"
-        "<｜Assistant｜><｜DSML｜ calls>"
-        '<｜DSML｜ invoke name="get_weather">'
-        '<｜DSML｜ parameter name="city" string="true">北京</｜DSML｜ parameter>'
-        "</｜DSML｜ invoke>"
-        "</｜DSML｜ calls>"
-    )
-    deepseek_enc = reloaded.encode(deepseek_tool_sample, add_special_tokens=False)
-    assert all(
-        reloaded.token_to_id(token) in deepseek_enc.ids
-        for token in ("<｜System｜>", "<｜Assistant｜>", "｜DSML｜")
-    )
-    assert reloaded.decode(
-        deepseek_enc.ids, skip_special_tokens=True
-    ) == deepseek_tool_sample
+```bash
+cd ~                     # 脚本可放仓库外；仓库内则 cd 到仓库根
+python min_tok.py        # 产物 tokenizer.json 落在 cwd
 ```
 
-运行：`cd ~ && python min_tok.py`。脚本末尾检查当前 `Split` 字段、固定 special ID、256 byte token、协议 flags/原子性、offset 连续性与 decode 无损。
+### 3a. 65536 词表与采样训练（16G 内存 / U 盘语料）
+
+`--vocab-size` 指最终 `get_vocab()` 总量（默认 131072），内部反推
+`trainer 预算 = target − len(PROTOCOL_TOKENS) − 256`（`BpeTrainer.vocab_size`
+是含 specials 的总量上限，protocol 住 `added_tokens` 不进 `model.vocab`，
+round-trip 后 ID 自动重排）。总量不符时门禁 loud-fail（碰撞或语料太小未触顶）。
+
+`--corpus` 可指单文件或目录（目录按 `--glob` 递归，默认 `*.txt`；
+`.jsonl/.json` 抽 `--text-field` 字段，`.gz` 直读，`.parquet` 用 pyarrow 按 batch
+流读 `text` 列）。`--corpus` 可多次指定多源（如英文/中文分目录），按 `--weights`
+（如 `96,81`）切分字节预算后顺序流——BPE 只计词频，源间顺序无关；
+字母表扫描同样按权覆盖各源，避免单语字母表漏字符。
+`.parquet` 可加 `--min-score`（配 `--score-field`，默认 `score`）过滤低分行；
+字段缺失时 loud-error 并列出可用列名。确定性排序单遍流，
+`--train-gb`（默认 32）、`--alphabet-gb`（默认 2）封顶字节数，
+字母表扫描与训练流共享同一文件顺序；stderr 每 512MiB 打进度（U 盘 stall 可见）。
+`--min-frequency` 默认 5（GB 级不用 2，省内存并过滤噪声）；
+`--shuffle-files --seed` 可打乱文件顺序。产物旁落同名 `.manifest.json`
+（含文件清单、流统计、词表组成），复现训练时连同保存。
+
+脚本末尾的门禁依次检查：当前 `Split` 只含 `pattern`/`behavior`/`invert`、`<unk>` 为 ID 0 且 special ID 连续、special/protocol 的 `special`/`normalized` 标志、256 个 `<0xHH>` 齐全、`Split` 切分样例、协议 token 原子匹配且 `skip_special_tokens=True` 仍保留、offset 连续与 decode 无损。
 
 ## 4. Chat Template 层
 
