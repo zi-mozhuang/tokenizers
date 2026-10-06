@@ -1682,7 +1682,7 @@
   "pre_tokenizer": {
     "type": "Split",
     "pattern": {
-      "Regex": "\\p{White_Space}*(?:[\\p{Han}\\p{Hiragana}\\p{Katakana}\\u30FC]+(?:[^\\p{White_Space}\\p{L}\\p{N}]*[\\p{Han}\\p{Hiragana}\\p{Katakana}\\u30FC]+)*|[\\p{Latin}]+(?:[^\\p{White_Space}\\p{L}\\p{N}]*[\\p{Latin}]+)*|\\p{N}+(?:[^\\p{White_Space}\\p{L}]*\\p{N}+)*)"
+      "Regex": "\\p{White_Space}*(?:[\\p{Han}\\p{Hiragana}\\p{Katakana}\\p{Hangul}\\u30FC]+(?:[·・･][\\p{Han}\\p{Hiragana}\\p{Katakana}\\p{Hangul}\\u30FC]+)*|[\\p{Latin}]+(?:[^\\p{White_Space}\\p{L}\\p{N}]*[\\p{Latin}]+)*|\\p{N}+(?:[^\\p{White_Space}\\p{L}]*\\p{N}+)*)"
     },
     "behavior": "MergedWithNext",
     "invert": false

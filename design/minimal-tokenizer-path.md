@@ -51,7 +51,13 @@ cd ~                     # 脚本可放仓库外；仓库内则 cd 到仓库根
 python min_tok.py        # 产物 tokenizer.json 落在 cwd
 ```
 
-### 3a. 65536 词表与采样训练（16G 内存 / U 盘语料）
+### 3a. 131072 词表与采样训练（64G 机器实测）
+
+`CLASS_REGEX` 汉字分支只取连续汉字段，硬断点（`。、…——`、全角`！？；，`）即断句，中点 `·・` 续接译名（定案与原因见 `uax29-sentence-pretokenizer.md` §1）。原拖尾写法会跨标点把整中文句并成一个 pre-token：中文无空格，子句近乎全唯一（实测唯一率 73.2%，英文仅 6.8%），trainer pair 表膨胀，吞吐崩到个位数 MiB/s。精简正则（显式码点替 `\p{Han/Latin/N}`）已否掉：中文 9.64% 行切分漂移且更慢（0.85x），`[\p{L}]` 无法枚举，做不到等价。
+
+内存按 `peak ≈ 2.0 × en_GiB + 25 × zh_GiB`（±30%）估算，上限 45GB。英文量大一样吃内存（15.37GiB 约贡献 30GB），中文占比与总训练量是两个独立旋钮。选参规则：先定中文 ≤1GiB，再反解 `--train-gb`。实测基线 `--weights 97,4 --train-gb 16`（en 15.37 + zh 0.63GiB）：字母表 8GiB ~2min，语料流 16GiB ~11min，`done:` 后 pair 统计 ~2.5min（RSS 4.6→45.8GB 峰值），BPE 105218 轮 ~6min 单核，全程 ~29min。合并只在唯一 pre-token 表上堆增量更新，不碰原文；该压的是建表峰值，不是合并耗时。`--min-frequency` 是 pair 合并阈值，不删词，对内存无影响。过滤低频片段走不通：中文 pair 证据来自各唯一子句的累加，丢低频子句即丢 87% 证据，且频次 ≥2 多为转载/模板文，有偏。
+
+监控：非真 TTY 无原生进度条，`done:` 后静默还有词频→合并两步，唯一完成判据是输出 `tokenizer.json` 出现；合并单核正常。日志 MiB/s 是累计平均。冒烟必须用小词表（如 16384，约 36s）；拿 131072 跑冒烟会陷十几万轮合并。
 
 `--vocab-size` 指最终 `get_vocab()` 总量（默认 131072），内部反推
 `trainer 预算 = target − len(PROTOCOL_TOKENS) − 256`（`BpeTrainer.vocab_size`

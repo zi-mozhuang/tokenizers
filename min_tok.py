@@ -16,8 +16,19 @@ from tokenizers.trainers import BpeTrainer
 CLASS_REGEX = (
     r"\p{White_Space}*"
     r"(?:"
-    r"[\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+"
-    r"(?:[^\p{White_Space}\p{L}\p{N}]*[\p{Han}\p{Hiragana}\p{Katakana}\u30FC]+)*"
+    # CJK：只取连续汉字段，硬断点即断句，唯中点续接。
+    # 硬断点（零他义）：。、…——（成双）、全角！？；，及换行。原拖尾写法
+    # (?:[^\p{White_Space}\p{L}\p{N}]*[\p{Han}...]+)* 会跨标点把整句并成一个
+    # pre-token，使 trainer 词表条目近乎全唯一、哈希表无限膨胀，中文侧吞吐崩到个位数
+    # MiB/s 且内存持续爬升，故去拖尾。拉丁与数字分支不受影响。
+    # 例外：中点 ·（U+00B7）・（U+30FB）･（U+FF65 半角）是译名间隔
+    # （奥巴马·马 / オバマ･ケア），属词内不断，允许续接同类；其余标点一律断开。
+    # · 罕见且只连短名，不会堆出长 run。
+    # 谚文 \p{Hangul} 并入本类：韩文此前无分支、整行成 gap 独片；
+    # 并入后韩文按空格散开（한국어 텍스트입니다 → 两片），与英文同机制；
+    # 汉谚无空格相接时粘连（如 中文한국어 一片），韩文名中的 · 同样续接。
+    r"[\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}\u30FC]+"
+    r"(?:[·・･][\p{Han}\p{Hiragana}\p{Katakana}\p{Hangul}\u30FC]+)*"
     r"|[\p{Latin}]+"
     r"(?:[^\p{White_Space}\p{L}\p{N}]*[\p{Latin}]+)*"
     r"|\p{N}+"

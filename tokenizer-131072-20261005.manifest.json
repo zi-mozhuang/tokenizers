@@ -1,0 +1,66 @@
+{
+  "trained": true,
+  "token_profile": "both",
+  "target_vocab": 131072,
+  "trainer_budget": 130721,
+  "min_frequency": 5,
+  "train_stream": [
+    {
+      "path": "F:\\datasets\\fineweb-edu-en",
+      "gib": 15.366,
+      "lines": 3453857,
+      "files": 5,
+      "seconds": 638.7
+    },
+    {
+      "path": "F:\\datasets\\chinese-fineweb-edu-v2",
+      "gib": 0.634,
+      "lines": 115368,
+      "files": 1,
+      "seconds": 31.0
+    }
+  ],
+  "alphabet_stream": [
+    {
+      "path": "F:\\datasets\\fineweb-edu-en",
+      "gib": 7.683,
+      "lines": 1722892,
+      "files": 3,
+      "seconds": 68.9
+    },
+    {
+      "path": "F:\\datasets\\chinese-fineweb-edu-v2",
+      "gib": 0.317,
+      "lines": 55891,
+      "files": 1,
+      "seconds": 4.5
+    }
+  ],
+  "sources": [
+    {
+      "path": "F:\\datasets\\fineweb-edu-en",
+      "weight": 97.0,
+      "n_files": 50
+    },
+    {
+      "path": "F:\\datasets\\chinese-fineweb-edu-v2",
+      "weight": 4.0,
+      "n_files": 90
+    }
+  ],
+  "glob": "*.parquet",
+  "score_filter": null,
+  "shuffle_files": false,
+  "seed": 1337,
+  "counts": {
+    "specials": 91,
+    "protocol_tokens": 95,
+    "protocol_new": 95,
+    "initial_alphabet": 22267,
+    "trained_vocab": 130721,
+    "byte_new": 256,
+    "model_vocab": 130977,
+    "total_vocab": 131072,
+    "merges": 105218
+  }
+}
